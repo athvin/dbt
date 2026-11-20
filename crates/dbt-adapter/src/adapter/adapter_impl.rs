@@ -710,6 +710,13 @@ impl AdapterImpl {
         if self.adapter_type() == LakeCompute {
             return duckdb_table_format_for_database(database).unwrap_or("iceberg");
         }
+        // DuckFleet's gateway persists every relation in a single DuckLake catalog,
+        // so its table format is always ducklake. This is what makes the shared
+        // DuckDB materialization macros skip CASCADE on DROP (which DuckLake rejects)
+        // and take the ducklake-safe rename path.
+        if self.adapter_type() == DuckFleet {
+            return "ducklake";
+        }
         if self.adapter_type() != DuckDB {
             return "default";
         }

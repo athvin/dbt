@@ -348,6 +348,9 @@ pub fn get_adapter_prefixes(dialect: &str) -> Vec<String> {
         // macros of its own and inherits DuckDB's.
         "lakecompute" => prefixes.push("duckdb".to_string()),
         "motherduck" => prefixes.push("duckdb".to_string()),
+        // DuckFleet defines no macros of its own; it runs DuckDB-flavored SQL on a
+        // remote gateway and inherits DuckDB's (ducklake-aware) macros.
+        "duckfleet" => prefixes.push("duckdb".to_string()),
         // Add other adapter hierarchies as needed
         _ => {}
     }
@@ -415,6 +418,8 @@ pub fn get_internal_packages(dialect: &str) -> Vec<String> {
         // See `get_adapter_prefixes`: lake compute has no macro package of its own.
         "lakecompute" => internal_packages.push("dbt_duckdb".to_string()),
         "motherduck" => internal_packages.push("dbt_duckdb".to_string()),
+        // DuckFleet defines no macro package of its own; it inherits DuckDB's.
+        "duckfleet" => internal_packages.push("dbt_duckdb".to_string()),
         // Add other adapter hierarchies as needed
         _ => {}
     }

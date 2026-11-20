@@ -2670,6 +2670,13 @@ impl Adapter {
 
     /// Extract the database name from a Jinja relation Value and look up its table format string.
     fn table_format(&self, relation_val: &Value) -> Option<&'static str> {
+        // DuckFleet persists everything in one DuckLake catalog, so every relation
+        // is ducklake regardless of whether the relation carries a `database` attr.
+        // Short-circuit here so the DuckDB macros skip CASCADE on DROP (which
+        // DuckLake rejects) even when the relation's database is unset.
+        if self.adapter_type() == AdapterType::DuckFleet {
+            return Some("ducklake");
+        }
         let database = relation_val.get_attr("database").ok().and_then(|v| {
             if v.is_undefined() || v.is_none() {
                 None
