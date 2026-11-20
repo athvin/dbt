@@ -52,13 +52,15 @@ use std::io::Read;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use arrow_array::{Array, RecordBatch, StringArray};
-use arrow_schema::SchemaRef;
+use arrow_array::{Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray};
+use arrow_schema::{ArrowError, Schema, SchemaRef};
 use minijinja::State;
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use ureq::{Agent, Body, Error as UreqError, http};
 use uuid::Uuid;
 
+use adbc_core::PartitionedResult;
+use adbc_core::options::{OptionStatement, OptionValue};
 use dbt_adbc::{Connection, QueryCtx, Statement};
 use dbt_adapter_engine::sidecar_client::{ColumnInfo, SidecarClient};
 use dbt_common::error::{AdapterError, AdapterErrorKind, AdapterResult};
@@ -470,12 +472,14 @@ impl std::fmt::Debug for DuckFleetConnection {
 
 impl Connection for DuckFleetConnection {
     fn new_statement(&mut self) -> adbc_core::error::Result<Box<dyn Statement>> {
-        // DuckFleet runs statements through the engine's sidecar `execute`, not a
-        // per-statement ADBC object.
-        Err(adbc_core::error::Error::with_message_and_status(
-            "DuckFleet routes execution through the gateway, not ADBC statements",
-            adbc_core::error::Status::NotImplemented,
-        ))
+        // A gateway-backed statement bound to this connection's node session, so
+        // the `conn.new_statement()` paths dbt uses (notably `dbt show` and
+        // ad-hoc queries) run on the same gateway session as the node's work.
+        Ok(Box::new(DuckFleetStatement {
+            client: Arc::clone(&self.client),
+            key: self.node_id.clone().unwrap_or_default(),
+            sql: None,
+        }))
     }
 
     fn update_node_id(&mut self, node_id: Option<String>) {
@@ -509,7 +513,7 @@ impl Connection for DuckFleetConnection {
         _catalog: Option<&str>,
         _db_schema: Option<&str>,
         _table_name: &str,
-    ) -> adbc_core::error::Result<arrow_schema::Schema> {
+    ) -> adbc_core::error::Result<Schema> {
         Err(adbc_core::error::Error::with_message_and_status(
             "DuckFleet: use the sidecar client's introspection, not get_table_schema",
             adbc_core::error::Status::NotImplemented,
@@ -524,11 +528,136 @@ impl Connection for DuckFleetConnection {
         _table_name: Option<&'a str>,
         _table_type: Option<Vec<&'a str>>,
         _column_name: Option<&'a str>,
-    ) -> adbc_core::error::Result<Box<dyn arrow_array::RecordBatchReader + Send + 'a>> {
+    ) -> adbc_core::error::Result<Box<dyn RecordBatchReader + Send + 'a>> {
         Err(adbc_core::error::Error::with_message_and_status(
             "DuckFleet: use the sidecar client's introspection, not get_objects",
             adbc_core::error::Status::NotImplemented,
         ))
+    }
+}
+
+fn not_supported(what: &str) -> adbc_core::error::Error {
+    adbc_core::error::Error::with_message_and_status(
+        format!("DuckFleet: {what} on ADBC statements is not supported"),
+        adbc_core::error::Status::NotImplemented,
+    )
+}
+
+/// A gateway-backed ADBC statement. dbt's DuckDB-family `conn.new_statement()`
+/// paths set SQL on it and execute; we route that to the node's gateway session
+/// via the shared client, so it shares the session (and transaction) with the
+/// node's materialization. Parameter binding is not wired to the gateway (the
+/// paths that reach here do not bind; seeds load via the adapter's bound-INSERT
+/// path, not this).
+struct DuckFleetStatement {
+    client: Arc<DuckFleetSidecarClient>,
+    key: String,
+    sql: Option<String>,
+}
+
+impl DuckFleetStatement {
+    fn run(&self, fetch: bool) -> adbc_core::error::Result<Option<RecordBatch>> {
+        let sql = self.sql.clone().ok_or_else(|| {
+            adbc_core::error::Error::with_message_and_status(
+                "DuckFleet: no SQL set on statement",
+                adbc_core::error::Status::InvalidState,
+            )
+        })?;
+        let session_id = self.client.session_for(&self.key).map_err(adapter_to_adbc)?;
+        self.client
+            .run_query(&session_id, &sql, fetch)
+            .map_err(adapter_to_adbc)
+    }
+}
+
+impl Statement for DuckFleetStatement {
+    fn set_sql_query(&mut self, sql: &str) -> adbc_core::error::Result<()> {
+        self.sql = Some(sql.to_string());
+        Ok(())
+    }
+
+    fn prepare(&mut self) -> adbc_core::error::Result<()> {
+        Ok(())
+    }
+
+    fn execute<'a>(
+        &'a mut self,
+    ) -> adbc_core::error::Result<Box<dyn RecordBatchReader + Send + 'a>> {
+        let (schema, batches): (SchemaRef, Vec<Result<RecordBatch, ArrowError>>) =
+            match self.run(true)? {
+                Some(batch) => (batch.schema(), vec![Ok(batch)]),
+                None => (Arc::new(Schema::empty()), Vec::new()),
+            };
+        Ok(Box::new(RecordBatchIterator::new(batches, schema)))
+    }
+
+    fn execute_update(&mut self) -> adbc_core::error::Result<Option<i64>> {
+        self.run(false)?;
+        // The gateway does not report an affected-row count.
+        Ok(None)
+    }
+
+    fn execute_schema(&mut self) -> adbc_core::error::Result<Schema> {
+        Ok(self
+            .run(true)?
+            .map(|batch| batch.schema().as_ref().clone())
+            .unwrap_or_else(Schema::empty))
+    }
+
+    fn execute_partitions(&mut self) -> adbc_core::error::Result<PartitionedResult> {
+        Err(not_supported("execute_partitions"))
+    }
+
+    fn bind(&mut self, _batch: RecordBatch) -> adbc_core::error::Result<()> {
+        Err(not_supported("parameter binding"))
+    }
+
+    fn bind_stream(
+        &mut self,
+        _reader: Box<dyn RecordBatchReader + Send>,
+    ) -> adbc_core::error::Result<()> {
+        Err(not_supported("parameter binding"))
+    }
+
+    fn set_substrait_plan(&mut self, _plan: &[u8]) -> adbc_core::error::Result<()> {
+        Err(not_supported("Substrait plans"))
+    }
+
+    fn get_parameter_schema(&self) -> adbc_core::error::Result<Schema> {
+        Ok(Schema::empty())
+    }
+
+    fn cancel(&mut self) -> adbc_core::error::Result<()> {
+        self.client.cancel_node(&Some(self.key.clone()));
+        Ok(())
+    }
+
+    // dbt sets context options (node id, phase, metadata, fetch, telemetry) on the
+    // statement and occasionally reads options back. The gateway path needs none of
+    // them (the session is keyed by node already), so these are benign rather than
+    // the trait defaults, which `unimplemented!()`-panic.
+    fn set_option(
+        &mut self,
+        _key: OptionStatement,
+        _value: OptionValue,
+    ) -> adbc_core::error::Result<()> {
+        Ok(())
+    }
+
+    fn get_option_string(&self, _key: OptionStatement) -> adbc_core::error::Result<String> {
+        Ok(String::new())
+    }
+
+    fn get_option_int(&self, _key: OptionStatement) -> adbc_core::error::Result<i64> {
+        Ok(0)
+    }
+
+    fn get_option_bytes(&self, _key: OptionStatement) -> adbc_core::error::Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+
+    fn get_option_double(&self, _key: OptionStatement) -> adbc_core::error::Result<f64> {
+        Ok(0.0)
     }
 }
 
@@ -623,7 +752,7 @@ impl GatewayFailure {
     /// draining/starting or a proxy returned 502/503/504.
     fn waitable_on_open(&self) -> bool {
         matches!(self.kind.as_deref(), Some("draining") | Some("starting"))
-            || matches!(self.status, 502 | 503 | 504)
+            || matches!(self.status, 502..=504)
     }
 
     fn into_adapter_error(self) -> AdapterError {

@@ -380,7 +380,11 @@ impl AdapterImpl {
             Replay(_, replay) => replay.metadata_adapter(),
             Impl(_, engine) => {
                 // In sidecar mode, schema hydration is handled via db_runner.
-                if engine.is_sidecar() {
+                // DuckFleet is a sidecar engine too, but it has no external
+                // db_runner: it must create schemas itself by issuing DDL through
+                // the gateway, so it falls through to the DuckDB-family metadata
+                // adapter below rather than returning None here.
+                if engine.is_sidecar() && self.adapter_type() != DuckFleet {
                     return None;
                 }
                 // The explicit mock adapter variant has no metadata adapter.
