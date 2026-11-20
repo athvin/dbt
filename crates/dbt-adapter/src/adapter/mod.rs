@@ -2579,7 +2579,8 @@ impl Adapter {
                     | AdapterType::Dremio
                     | AdapterType::Oracle
                     | AdapterType::LakeCompute
-                    | AdapterType::MotherDuck => Err(AdapterError::new(
+                    | AdapterType::MotherDuck
+                    | AdapterType::DuckFleet => Err(AdapterError::new(
                         AdapterErrorKind::NotSupported,
                         format!("has_dbr_capability is only supported by the Databricks adapter. Use the portable adapter.has_feature(\"{}\") instead.", capability_name),
                     )
@@ -2610,7 +2611,8 @@ impl Adapter {
                 | AdapterType::Dremio
                 | AdapterType::Oracle
                 | AdapterType::LakeCompute
-                | AdapterType::MotherDuck => Ok(Value::from(false)),
+                | AdapterType::MotherDuck
+                | AdapterType::DuckFleet => Ok(Value::from(false)),
             },
         }
     }

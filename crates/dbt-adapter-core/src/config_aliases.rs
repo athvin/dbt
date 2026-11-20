@@ -37,7 +37,8 @@ pub fn config_aliases(adapter_type: AdapterType) -> &'static [(&'static str, &'s
         AdapterType::Snowflake
         | AdapterType::Spark
         | AdapterType::DuckDB
-        | AdapterType::MotherDuck => &[],
+        | AdapterType::MotherDuck
+        | AdapterType::DuckFleet => &[],
         // TODO(fs#13424): `_ALIASES` not transcribed for this adapter -- its Python package was
         // not vendored in the local cache used to populate this map.
         AdapterType::Salesforce

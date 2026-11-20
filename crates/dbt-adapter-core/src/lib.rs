@@ -95,6 +95,11 @@ pub enum AdapterType {
     LakeCompute,
     /// MotherDuck
     MotherDuck,
+    /// DuckFleet: a DuckDB-flavored adapter whose statements run on a remote
+    /// DuckFleet gateway. Shares DuckDB's SQL dialect, quoting, and relation
+    /// rules; only execution is routed over HTTP, and a model's
+    /// `meta.platform` (cpu/memory/disk) sizes a dedicated pod.
+    DuckFleet,
 }
 
 impl AdapterType {
@@ -134,7 +139,7 @@ pub fn quote_char(adapter_type: AdapterType) -> char {
         Redshift => '"',
         Postgres | Salesforce => '"',
         Fabric => '"',
-        DuckDB | LakeCompute | MotherDuck => '"',
+        DuckDB | LakeCompute | MotherDuck | DuckFleet => '"',
         Athena | Trino | Starburst => '"',
         Datafusion => '"',
         // https://clickhouse.com/docs/sql-reference/syntax#identifiers
@@ -291,6 +296,7 @@ mod tests {
                 (AdapterType::Oracle, "oracle"),
                 (AdapterType::LakeCompute, "lakecompute"),
                 (AdapterType::MotherDuck, "motherduck"),
+                (AdapterType::DuckFleet, "duckfleet"),
             ]
         );
     }

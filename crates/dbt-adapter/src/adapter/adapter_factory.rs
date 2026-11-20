@@ -51,6 +51,11 @@ pub fn backend_of(adapter_type: AdapterType) -> Backend {
         AdapterType::Oracle => todo!("Oracle"),
         AdapterType::Datafusion => todo!("Datafusion"),
         AdapterType::MotherDuck => Backend::MotherDuck,
+        // DuckFleet executes over HTTP to the DuckFleet gateway, not through a
+        // local ADBC backend, so it has no `Backend`. The engine is selected
+        // separately (SidecarEngine); this arm is never reached once that
+        // selection lands.
+        AdapterType::DuckFleet => todo!("DuckFleet execution engine: stage 2"),
     }
 }
 

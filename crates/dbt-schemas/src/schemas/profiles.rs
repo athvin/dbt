@@ -327,11 +327,14 @@ impl DbConfig {
                 "fivetran_auth_url",
             ],
             // Adapter types with no `DbConfig` variant, so nothing to display.
+            // DuckFleet's `DbConfig` variant (endpoint + token) is stage-2; `token`
+            // must stay out of this list when added, like LakeCompute's above.
             AdapterType::Athena
             | AdapterType::Starburst
             | AdapterType::Dremio
             | AdapterType::Oracle
-            | AdapterType::MotherDuck => &[],
+            | AdapterType::MotherDuck
+            | AdapterType::DuckFleet => &[],
             AdapterType::Spark => &[
                 "method",
                 "host",

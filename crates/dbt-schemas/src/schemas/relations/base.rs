@@ -572,7 +572,8 @@ pub trait BaseRelation: BaseRelationProperties + Any + Send + Sync + fmt::Debug 
             | AdapterType::DuckDB
             | AdapterType::LakeCompute
             | AdapterType::Fabric
-            | AdapterType::MotherDuck => (
+            | AdapterType::MotherDuck
+            | AdapterType::DuckFleet => (
                 start.map(|start| format!("{event_time} >= '{start}'")),
                 end.map(|end| format!("{event_time} < '{end}'")),
             ),

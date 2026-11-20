@@ -149,7 +149,7 @@ pub fn max_identifier_length(adapter_type: AdapterType) -> Option<NonZero<usize>
         }
         Snowflake | Bigquery | Databricks | Spark | DuckDB | Salesforce | Fabric | ClickHouse
         | Exasol | Athena | Starburst | Trino | Datafusion | Dremio | Oracle | LakeCompute
-        | MotherDuck => None,
+        | MotherDuck | DuckFleet => None,
     }
 }
 
@@ -209,6 +209,7 @@ pub fn is_valid_ident_char(c: char, backend: AdapterType) -> bool {
             | Oracle
             | LakeCompute
             | MotherDuck
+            | DuckFleet
             | Exasol => c.is_alphanumeric() || c == '_',
     }
 }

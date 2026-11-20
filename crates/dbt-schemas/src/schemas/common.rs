@@ -1089,6 +1089,14 @@ pub fn constraint_support(
         (MotherDuck, Check) => NotSupported,
         (MotherDuck, Custom) => NotSupported,
 
+        // DuckFleet - follows DuckDB
+        (DuckFleet, NotNull) => Enforced,
+        (DuckFleet, ForeignKey) => Enforced,
+        (DuckFleet, Unique) => NotEnforced,
+        (DuckFleet, PrimaryKey) => NotEnforced,
+        (DuckFleet, Check) => NotSupported,
+        (DuckFleet, Custom) => NotSupported,
+
         // Fabric
         (Fabric, Check) => NotSupported,
         (Fabric, NotNull) => Enforced,

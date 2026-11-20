@@ -134,6 +134,12 @@ impl ProfileSetup {
             MotherDuck => {
                 todo!("setup_motherduck_profile")
             }
+            DuckFleet => {
+                // Stage 2: a DuckFleet profile is `endpoint` + `token` (bearer),
+                // yielding a `DbConfig::DuckFleet`. No local DuckDB config is
+                // accepted — DuckDB is configured on the gateway, not here.
+                todo!("DuckFleet execution engine: stage 2")
+            }
         }
     }
 }
