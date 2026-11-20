@@ -2106,7 +2106,8 @@ impl AdapterImpl {
 
         // platform-specific features.
         match self.adapter_type() {
-            DuckDB => match name {
+            // DuckFleet is DuckDB-flavored; mirror DuckDB's per-feature answers.
+            DuckDB | DuckFleet => match name {
                 "motherduck" => Ok(Some(duckdb_is_motherduck(self.engine().get_config()))),
                 _ => {
                     emit_warn_log_message(
@@ -3838,7 +3839,32 @@ impl AdapterImpl {
 
                 Ok(none_value())
             }
-            DuckDB | MotherDuck | DuckFleet => {
+            DuckFleet => {
+                // DuckFleet executes on a remote gateway that cannot read the dbt
+                // client's local seed file, so a seed is always read client-side and
+                // bulk-ingested as bound INSERTs — never a server-side COPY of a
+                // client path (matching the old Python adapter's seed contract).
+                //
+                // NOTE: ingest_seed_csv drives `conn.new_statement()`, which the
+                // DuckFleet connection does not yet implement (execution currently
+                // routes through the engine's sidecar `execute`). Seeds therefore
+                // need a gateway-backed Statement (or an engine-routed seed path)
+                // before they run end-to-end; the routing here is the correct policy.
+                if self.engine().is_mock() {
+                    return Ok(none_value());
+                }
+                dbt_adapter_engine::duckdb::seed::ingest_seed_csv(
+                    ctx,
+                    conn.as_mut(),
+                    database,
+                    schema,
+                    table_name,
+                    file_path,
+                    field_delimiter,
+                )?;
+                Ok(none_value())
+            }
+            DuckDB | MotherDuck => {
                 // DuckDB cannot access local files when `motherduck_saas_mode`
                 // is enabled. In that case, we need to load the dataset in
                 // memory and bulk-ingest it into the motherduck instance
