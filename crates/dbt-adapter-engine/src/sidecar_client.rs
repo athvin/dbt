@@ -58,6 +58,13 @@ pub trait SidecarClient: Debug + Send + Sync {
         node_id: Option<String>,
     ) -> AdapterResult<Box<dyn Connection>>;
 
+    /// Records, for `node_id`, the per-node compute the next session opened for it
+    /// should carry — read from the model's resolved config in `state`. Called before
+    /// each statement executes, which is the only point the running model's config is
+    /// populated in the Jinja `state` (it is not at `new_connection` time). The default
+    /// is a no-op; a routing sidecar (DuckFleet) overrides it to size a per-model pod.
+    fn note_compute(&self, _node_id: Option<&str>, _state: Option<&State>) {}
+
     /// Should be called when the adapter is dropped or the dbt run completes.
     fn shutdown(&self) -> AdapterResult<()>;
 

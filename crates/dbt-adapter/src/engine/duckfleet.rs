@@ -370,6 +370,18 @@ impl SidecarClient for DuckFleetSidecarClient {
         Ok(Box::new(DuckFleetConnection { client, node_id }))
     }
 
+    fn note_compute(&self, node_id: Option<&str>, state: Option<&State>) {
+        let key = node_id.unwrap_or_default().to_string();
+        // Learn the size only until the node's session is open; once it is, the pod is
+        // fixed for the node's lifetime, and a later statement whose state carries a
+        // thinner config must not be read as a downgrade.
+        if self.sessions.lock().unwrap().contains_key(&key) {
+            return;
+        }
+        let compute = compute_from_state(state);
+        self.pending_compute.lock().unwrap().insert(key, compute);
+    }
+
     fn shutdown(&self) -> AdapterResult<()> {
         let sessions: Vec<String> = {
             let mut map = self.sessions.lock().unwrap();

@@ -137,7 +137,7 @@ impl AdapterEngine for SidecarEngine {
 
     fn execute_with_options(
         &self,
-        _state: Option<&State>,
+        state: Option<&State>,
         ctx: &QueryCtx,
         _conn: &'_ mut dyn Connection,
         sql: &str,
@@ -145,6 +145,11 @@ impl AdapterEngine for SidecarEngine {
         fetch: bool,
         _token: CancellationToken,
     ) -> AdapterResult<RecordBatch> {
+        // The running model's resolved config (and thus `meta.platform`) is populated
+        // in the Jinja `state` here — not at `new_connection` time — so this is where a
+        // routing sidecar learns the per-model compute before its session is opened.
+        self.client
+            .note_compute(ctx.node_id().map(String::as_str), state);
         // Route through sidecar client
         let batch_opt = self.client.execute(ctx, sql, fetch)?;
         match batch_opt {
