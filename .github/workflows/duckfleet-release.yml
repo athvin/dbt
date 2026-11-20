@@ -1,0 +1,70 @@
+name: duckfleet-release
+
+# Builds the `dbt` binary (dbt-sa-cli -> dbt-main -> dbt-compilation/dbt-adapter,
+# so the DuckFleet adapter is compiled in) and publishes it so DuckFleet's own
+# CI and dbt fixture can download a pinned, prebuilt binary instead of
+# compiling dbt-core (~45 min) themselves.
+#
+# Trigger manually (workflow_dispatch) for a throwaway artifact, or push a
+# `duckfleet-v*` tag to cut a GitHub Release with the binary attached.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'duckfleet-v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: duckfleet-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-linux-x86_64:
+    runs-on: ubuntu-latest
+    env:
+      # The workspace pins arrow/datafusion/ring to sdf-labs git forks; fetch
+      # them with the git CLI so credentials/proxies behave on the runner.
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # One cache for this workflow; the arrow/datafusion forks dominate the
+          # build, so sharing across runs turns the ~45 min cold build into minutes.
+          shared-key: duckfleet-release-linux
+
+      - name: Build dbt (release)
+        run: cargo build --release --locked --bin dbt
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          strip target/release/dbt
+          "target/release/dbt" --version > dist/dbt.version || echo "unknown" > dist/dbt.version
+          tar -C target/release -czf dist/dbt-linux-x86_64.tar.gz dbt
+          ( cd dist && sha256sum dbt-linux-x86_64.tar.gz > dbt-linux-x86_64.tar.gz.sha256 )
+          ls -l dist
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbt-linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/dbt-linux-x86_64.tar.gz
+            dist/dbt-linux-x86_64.tar.gz.sha256
