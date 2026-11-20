@@ -510,14 +510,24 @@ impl Connection for DuckFleetConnection {
 
     fn get_table_schema(
         &self,
-        _catalog: Option<&str>,
-        _db_schema: Option<&str>,
-        _table_name: &str,
+        catalog: Option<&str>,
+        db_schema: Option<&str>,
+        table_name: &str,
     ) -> adbc_core::error::Result<Schema> {
-        Err(adbc_core::error::Error::with_message_and_status(
-            "DuckFleet: use the sidecar client's introspection, not get_table_schema",
-            adbc_core::error::Status::NotImplemented,
-        ))
+        // Resolve the relation's Arrow schema by asking the gateway for a
+        // zero-row result set. Seed loading uses this to learn column types.
+        let quote = |ident: &str| format!("\"{}\"", ident.replace('"', "\"\""));
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(catalog) = catalog {
+            parts.push(quote(catalog));
+        }
+        if let Some(db_schema) = db_schema {
+            parts.push(quote(db_schema));
+        }
+        parts.push(quote(table_name));
+        let sql = format!("SELECT * FROM {} LIMIT 0", parts.join("."));
+        let batch = self.client.run_metadata(&sql).map_err(adapter_to_adbc)?;
+        Ok(batch.schema().as_ref().clone())
     }
 
     fn get_objects<'a>(
