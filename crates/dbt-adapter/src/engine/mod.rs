@@ -30,6 +30,9 @@ pub use record_replay::RecordReplayEngine;
 mod sidecar;
 pub use sidecar::SidecarEngine;
 
+mod duckfleet;
+pub use duckfleet::DuckFleetSidecarClient;
+
 /// Execute query and retry in case of an error. Retry is done (up to
 /// the given limit) regardless of the error encountered.
 ///

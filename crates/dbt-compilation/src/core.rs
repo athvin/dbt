@@ -12,7 +12,7 @@ use dbt_adapter::{
     adapter::AdapterFactory,
     cache::RelationCache,
     config::AdapterConfig,
-    engine::{SidecarClient, SidecarEngine, query_comment::QueryCommentConfig},
+    engine::{DuckFleetSidecarClient, SidecarClient, SidecarEngine, query_comment::QueryCommentConfig},
     sql_types::TypeOpsFactory,
 };
 use dbt_adbc::Backend;
@@ -792,7 +792,49 @@ impl DbtLoadedProject {
             !introspect_enabled || matches!(execute, Execute::Sidecar | Execute::Service);
         let offline = connection_mode == AdapterConnectionMode::Offline;
         let use_local_mock_adapter = offline || (executes_locally && !is_mantle_replay);
-        let adapter = if matches!(
+        let adapter = if adapter_type == AdapterType::DuckFleet {
+            // DuckFleet executes remotely over HTTP to the gateway. Build a
+            // SidecarEngine backed by the DuckFleet HTTP client; the gateway
+            // endpoint + bearer token come from the profile, and a model's
+            // meta.platform (read per-node in the client) sizes its pod.
+            let profile = AdapterConfig::new(db_config.clone());
+            let endpoint = profile
+                .get_string("endpoint")
+                .ok_or_else(|| {
+                    fs_err!(
+                        ErrorCode::InvalidConfig,
+                        "DuckFleet profile is missing 'endpoint' (the gateway base URL)"
+                    )
+                })?
+                .to_string();
+            let bearer_token = profile
+                .get_string("token")
+                .ok_or_else(|| {
+                    fs_err!(
+                        ErrorCode::InvalidConfig,
+                        "DuckFleet profile is missing 'token' (a gateway bearer token is required)"
+                    )
+                })?
+                .to_string();
+            let client: Arc<dyn SidecarClient> =
+                DuckFleetSidecarClient::new(endpoint, bearer_token);
+            let sidecar_engine = SidecarEngine::new(
+                adapter_type,
+                Backend::DuckDBExtended,
+                client,
+                root_project_quoting,
+                AdapterConfig::default(),
+                type_ops_factory.create(adapter_type),
+                adapter_factory.stmt_splitter(),
+                QueryCommentConfig::from_query_comment(None, adapter_type, false, None),
+                Arc::new(RelationCache::default()),
+            );
+            let adapter_impl = AdapterImpl::new(
+                Arc::new(sidecar_engine) as Arc<dyn AdapterEngine>,
+                schema_store,
+            );
+            Arc::new(Adapter::new(Arc::new(adapter_impl), None, token.clone()))
+        } else if matches!(
             adapter_type,
             AdapterType::DuckDB | AdapterType::LakeCompute | AdapterType::MotherDuck
         ) {

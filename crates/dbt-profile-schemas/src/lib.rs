@@ -135,10 +135,14 @@ impl ProfileSetup {
                 todo!("setup_motherduck_profile")
             }
             DuckFleet => {
-                // Stage 2: a DuckFleet profile is `endpoint` + `token` (bearer),
-                // yielding a `DbConfig::DuckFleet`. No local DuckDB config is
-                // accepted — DuckDB is configured on the gateway, not here.
-                todo!("DuckFleet execution engine: stage 2")
+                // A DuckFleet profile is `endpoint` + bearer `token`, yielding a
+                // `DbConfig::DuckFleet`. DuckDB is configured on the gateway, not
+                // here, so no local-DuckDB keys apply; `database` defaults to the
+                // shared DuckLake catalog `lake`.
+                let existing = unwrap_db_config!(DuckFleet);
+                let mut config = existing.map(|c| c.as_ref().clone()).unwrap_or_default();
+                config.database.get_or_insert_with(|| "lake".to_string());
+                Ok(DbConfig::DuckFleet(Box::new(config)))
             }
         }
     }

@@ -54,6 +54,8 @@ pub enum DbConfig {
     Databricks(Box<DatabricksDbConfig>),
     Salesforce(Box<SalesforceDbConfig>),
     DuckDB(Box<DuckDbConfig>),
+    /// DuckFleet: a remote DuckDB gateway (`endpoint` + bearer `token`).
+    DuckFleet(Box<DuckFleetDbConfig>),
     /// The dbt lake compute engine.
     LakeCompute(Box<LakeComputeConfig>),
     // Hive,
@@ -175,6 +177,7 @@ impl DbConfig {
             DbConfig::Salesforce(config) => config.client_id.as_deref(),
             // DuckDB `path` is optional — attach-only profiles default to `:memory:`.
             DbConfig::DuckDB(config) => Some(config.path.as_deref().unwrap_or(":memory:")),
+            DbConfig::DuckFleet(config) => config.endpoint.as_deref(),
             DbConfig::LakeCompute(config) => config.base_url.as_deref(),
             DbConfig::Spark(config) if config.is_fabric_lakehouse() => {
                 config.lakehouseid.as_deref()
@@ -326,15 +329,15 @@ impl DbConfig {
                 "organization",
                 "fivetran_auth_url",
             ],
+            // `token` is deliberately absent so `dbt debug` never prints it,
+            // like LakeCompute above.
+            AdapterType::DuckFleet => &["endpoint", "database", "schema"],
             // Adapter types with no `DbConfig` variant, so nothing to display.
-            // DuckFleet's `DbConfig` variant (endpoint + token) is stage-2; `token`
-            // must stay out of this list when added, like LakeCompute's above.
             AdapterType::Athena
             | AdapterType::Starburst
             | AdapterType::Dremio
             | AdapterType::Oracle
-            | AdapterType::MotherDuck
-            | AdapterType::DuckFleet => &[],
+            | AdapterType::MotherDuck => &[],
             AdapterType::Spark => &[
                 "method",
                 "host",
@@ -441,6 +444,7 @@ impl DbConfig {
             DbConfig::Spark(config) => dbt_yaml::to_value(config),
             DbConfig::Fabric(config) => dbt_yaml::to_value(config),
             DbConfig::DuckDB(config) => dbt_yaml::to_value(config),
+            DbConfig::DuckFleet(config) => dbt_yaml::to_value(config),
             DbConfig::LakeCompute(config) => dbt_yaml::to_value(config),
             DbConfig::Exasol(config) => dbt_yaml::to_value(config),
             DbConfig::ClickHouse(config) => dbt_yaml::to_value(config),
@@ -458,6 +462,7 @@ impl DbConfig {
             DbConfig::Databricks(..) => AdapterType::Databricks,
             DbConfig::Salesforce(..) => AdapterType::Salesforce,
             DbConfig::DuckDB(..) => AdapterType::DuckDB,
+            DbConfig::DuckFleet(..) => AdapterType::DuckFleet,
             DbConfig::Spark(..) => AdapterType::Spark,
             DbConfig::Fabric(..) => AdapterType::Fabric,
             DbConfig::Exasol(..) => AdapterType::Exasol,
@@ -477,6 +482,7 @@ impl DbConfig {
             DbConfig::Databricks(config) => config.database.as_ref(),
             DbConfig::Salesforce(config) => config.database.as_ref(),
             DbConfig::DuckDB(config) => config.database.as_ref(),
+            DbConfig::DuckFleet(config) => config.database.as_ref(),
             DbConfig::Spark(config) => config.database(),
             DbConfig::Fabric(config) => config.database.as_ref(),
             DbConfig::Exasol(config) => config.database.as_ref(),
@@ -517,6 +523,7 @@ impl DbConfig {
             DbConfig::Databricks(config) => config.schema.as_ref(),
             DbConfig::Spark(config) => config.schema.as_ref(),
             DbConfig::DuckDB(config) => config.schema.as_ref(),
+            DbConfig::DuckFleet(config) => config.schema.as_ref(),
             DbConfig::LakeCompute(config) => config.schema.as_ref(),
             DbConfig::Salesforce(_) => None,
             DbConfig::Fabric(config) => config.schema.as_ref(),
@@ -546,6 +553,7 @@ impl DbConfig {
             DbConfig::Postgres(config) => config.threads.as_ref(),
             DbConfig::Trino(config) => config.threads.as_ref(),
             DbConfig::DuckDB(config) => config.threads.as_ref(),
+            DbConfig::DuckFleet(config) => config.threads.as_ref(),
             DbConfig::Datafusion(_) => None,
             DbConfig::Salesforce(_) => None,
             DbConfig::Spark(config) => config.threads.as_ref(),
@@ -565,6 +573,7 @@ impl DbConfig {
             DbConfig::Trino(config) => config.threads = threads,
             DbConfig::Redshift(config) => config.threads = threads,
             DbConfig::DuckDB(config) => config.threads = threads,
+            DbConfig::DuckFleet(config) => config.threads = threads,
             DbConfig::Datafusion(_) => (),
             DbConfig::Salesforce(_) => (),
             DbConfig::Spark(config) => config.threads = threads,
@@ -1248,6 +1257,27 @@ pub struct DuckDbAttachment {
     /// managed DuckLake where the path uses `md:` instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_ducklake: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, DbtSchema, Merge)]
+#[merge(strategy = merge_strategies_extend::overwrite_option)]
+#[serde(rename_all = "snake_case")]
+pub struct DuckFleetDbConfig {
+    /// Base URL of the DuckFleet gateway (e.g. `http://duckfleet:8080`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// Bearer token for the gateway. Deliberately kept out of `connection_keys_for`
+    /// so `dbt debug` never prints it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// The shared DuckLake catalog; always `lake`, defaulted at profile setup.
+    /// DuckDB itself is configured on the gateway, never in this profile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threads: Option<StringOrInteger>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, DbtSchema, Merge)]
@@ -2480,6 +2510,25 @@ impl TryFrom<DbConfig> for TargetContext {
                     },
                 }))
             }
+
+            DbConfig::DuckFleet(config) => Ok(TargetContext::DuckDB(DuckDbTargetEnv {
+                // DuckFleet runs remotely; there is no local path.
+                path: None,
+                __common__: CommonTargetContext {
+                    database: config.database.clone().unwrap_or_else(|| "lake".to_string()),
+                    schema: config.schema.unwrap_or_else(|| "main".to_string()),
+                    type_: adapter_type,
+                    threads: match config.threads {
+                        Some(StringOrInteger::String(threads)) => Some(
+                            threads
+                                .parse::<u16>()
+                                .map_err(|_| "threads must be a positive integer".to_string())?,
+                        ),
+                        Some(StringOrInteger::Integer(threads)) => Some(threads as u16),
+                        None => None,
+                    },
+                },
+            })),
 
             DbConfig::Spark(config) => spark_target_context(*config, adapter_type),
             DbConfig::Fabric(config) => {
