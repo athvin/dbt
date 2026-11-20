@@ -36,7 +36,10 @@ jobs:
       # prost-build, which shells out to `protoc`. It is the only native build
       # tool the workspace needs (no cmake; rustls uses ring, not aws-lc).
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+        # protobuf-compiler ships the `protoc` binary; libprotobuf-dev ships the
+        # well-known-type .proto files (google/protobuf/*.proto) under /usr/include
+        # that dbt-state's protos import — protoc finds them on its default include path.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
