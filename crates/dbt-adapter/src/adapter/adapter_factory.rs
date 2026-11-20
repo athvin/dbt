@@ -22,7 +22,9 @@ use crate::Adapter;
 use crate::AdapterEngine;
 use crate::cache::RelationCache;
 use crate::engine::AdbcEngine;
+use crate::engine::DuckFleetSidecarClient;
 use crate::engine::RecordReplayEngine;
+use crate::engine::SidecarEngine;
 use crate::engine::query_comment::QueryCommentConfig;
 use crate::relation::do_create_relation;
 use crate::sql_types::TypeOpsFactory;
@@ -105,6 +107,34 @@ impl DefaultAdapterFactory {
         cloud_config: Option<&ResolvedCloudConfig>,
         threads: Option<usize>,
     ) -> FsResult<Arc<dyn AdapterEngine>> {
+        // DuckFleet executes over HTTP to the DuckFleet gateway through a
+        // SidecarEngine at every entry point (run, debug, compile) -- never a
+        // local ADBC driver or DuckDB auth. It shares DuckDB's dialect, so only
+        // the execution path differs.
+        if adapter_type == AdapterType::DuckFleet {
+            let endpoint = adapter_config
+                .get_string("endpoint")
+                .map(|value| value.into_owned())
+                .unwrap_or_default();
+            let token = adapter_config
+                .get_string("token")
+                .map(|value| value.into_owned())
+                .unwrap_or_default();
+            let client = DuckFleetSidecarClient::new(endpoint, token);
+            let type_ops = type_ops_factory.create(adapter_type);
+            let engine = SidecarEngine::new(
+                AdapterType::DuckFleet,
+                Backend::DuckDBExtended,
+                client,
+                quoting,
+                adapter_config,
+                type_ops,
+                self.stmt_splitter(),
+                QueryCommentConfig::from_query_comment(query_comment, adapter_type, true, cloud_config),
+                Arc::new(RelationCache::default()),
+            );
+            return Ok(Arc::new(engine));
+        }
         let backend = backend_of(adapter_type);
         let auth: Arc<dyn Auth> = auth_for_backend(backend).into();
         let stmt_splitter = self.stmt_splitter();
