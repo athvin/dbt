@@ -315,19 +315,15 @@ async fn collect_packages(
 
 /// Returns the list of internal package directory names for a given adapter type.
 pub fn internal_package_names(adapter_type: AdapterType) -> Vec<String> {
-    // DuckFleet ships no macro package of its own: it shares DuckDB's
-    // materializations (its dialect dispatches as duckdb), so its embedded
-    // macro package is dbt-duckdb, not the nonexistent dbt-duckfleet.
-    let adapter_package = match adapter_type {
-        AdapterType::DuckFleet => "dbt-duckdb".to_string(),
-        _ => format!("dbt-{adapter_type}"),
-    };
+    let adapter_package = format!("dbt-{adapter_type}");
     let mut packages = vec!["dbt-adapters".to_string(), adapter_package];
     match adapter_type {
         AdapterType::Redshift => packages.push("dbt-postgres".to_string()),
         AdapterType::Databricks => packages.push("dbt-spark".to_string()),
         AdapterType::LakeCompute => packages.push("dbt-duckdb".to_string()),
         AdapterType::MotherDuck => packages.push("dbt-duckdb".to_string()),
+        // DuckFleet has its own (seed-override) package and inherits DuckDB's.
+        AdapterType::DuckFleet => packages.push("dbt-duckdb".to_string()),
         _ => {}
     }
     packages
