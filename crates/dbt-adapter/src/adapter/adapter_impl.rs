@@ -5834,18 +5834,24 @@ fn with_create_or_alter_hint(
 }
 
 impl AdapterImpl {
-    /// Whether this adapter wraps a node's statements in a server transaction, like dbt-redshift.
-    /// Opt-in through `redshift_use_transactions`; `redshift_skip_autocommit_transaction_statements`
-    /// still turns it off, as it does in dbt-redshift.
+    /// Whether this adapter wraps a node's statements in a server transaction.
+    /// DuckFleet always does so through its per-node gateway session. Redshift opts in through
+    /// `redshift_use_transactions`; `redshift_skip_autocommit_transaction_statements` still turns
+    /// it off, as it does in dbt-redshift.
     pub(crate) fn manages_transactions(&self) -> bool {
-        let flag = |name: &str| {
-            self.behavior_object()
-                .get_value(&Value::from(name))
-                .is_some_and(|flag| flag.is_true())
-        };
-        self.adapter_type() == Redshift
-            && flag("redshift_use_transactions")
-            && !flag("redshift_skip_autocommit_transaction_statements")
+        match self.adapter_type() {
+            DuckFleet => true,
+            Redshift => {
+                let flag = |name: &str| {
+                    self.behavior_object()
+                        .get_value(&Value::from(name))
+                        .is_some_and(|flag| flag.is_true())
+                };
+                flag("redshift_use_transactions")
+                    && !flag("redshift_skip_autocommit_transaction_statements")
+            }
+            _ => false,
+        }
     }
 
     /// Commits the transaction a macro opened on this thread, if transactions are managed and one
