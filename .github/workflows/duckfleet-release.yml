@@ -22,8 +22,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-linux-x86_64:
-    runs-on: ubuntu-latest
+  build-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    name: build-linux-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
     env:
       # The workspace pins arrow/datafusion/ring to sdf-labs git forks; fetch
       # them with the git CLI so credentials/proxies behave on the runner.
@@ -47,26 +56,28 @@ jobs:
         with:
           # One cache for this workflow; the arrow/datafusion forks dominate the
           # build, so sharing across runs turns the ~45 min cold build into minutes.
-          shared-key: duckfleet-release-linux
+          shared-key: duckfleet-release-linux-${{ matrix.arch }}
 
       - name: Build dbt (release)
         run: cargo build --release --locked --bin dbt
 
       - name: Package
         id: package
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           mkdir -p dist
           strip target/release/dbt
           "target/release/dbt" --version > dist/dbt.version || echo "unknown" > dist/dbt.version
-          tar -C target/release -czf dist/dbt-linux-x86_64.tar.gz dbt
-          ( cd dist && sha256sum dbt-linux-x86_64.tar.gz > dbt-linux-x86_64.tar.gz.sha256 )
+          tar -C target/release -czf "dist/dbt-linux-${ARCH}.tar.gz" dbt
+          ( cd dist && sha256sum "dbt-linux-${ARCH}.tar.gz" > "dbt-linux-${ARCH}.tar.gz.sha256" )
           ls -l dist
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dbt-linux-x86_64
+          name: dbt-linux-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
 
@@ -75,5 +86,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/dbt-linux-x86_64.tar.gz
-            dist/dbt-linux-x86_64.tar.gz.sha256
+            dist/dbt-linux-${{ matrix.arch }}.tar.gz
+            dist/dbt-linux-${{ matrix.arch }}.tar.gz.sha256
