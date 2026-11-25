@@ -75,6 +75,12 @@ const OPEN_RETRY_SECS: u64 = 90;
 /// Python client's 450s open ceiling with headroom.
 const AGENT_TIMEOUT_SECS: u64 = 600;
 
+#[derive(Clone)]
+struct DuckFleetSession {
+    id: String,
+    execution: Arc<Mutex<()>>,
+}
+
 /// A blocking HTTP client that routes dbt execution to a DuckFleet gateway.
 pub struct DuckFleetSidecarClient {
     /// Base URL of the gateway, trailing slash trimmed (e.g. `http://duckfleet:8080`).
@@ -82,9 +88,10 @@ pub struct DuckFleetSidecarClient {
     /// Bearer credential; never logged or surfaced by `dbt debug`.
     auth_header: String,
     agent: Agent,
-    /// node_id -> open gateway `session_id`. `""` is the metadata/introspection
-    /// session (always persistent; it never carries a compute size).
-    sessions: Mutex<HashMap<String, String>>,
+    /// node_id -> open gateway session. `""` is the metadata/introspection
+    /// session (always persistent; it never carries a compute size). Each session
+    /// serializes execution because the gateway permits one outstanding statement.
+    sessions: Mutex<HashMap<String, DuckFleetSession>>,
     /// node_id -> the `compute` JSON resolved from that node's `meta.platform`,
     /// captured in `new_connection` and consumed the first time the session opens.
     pending_compute: Mutex<HashMap<String, JsonValue>>,
@@ -197,9 +204,9 @@ impl DuckFleetSidecarClient {
 
     /// Get the open session for `key`, opening one (sized from any pending
     /// compute, else persistent) if absent.
-    fn session_for(&self, key: &str) -> AdapterResult<String> {
-        if let Some(id) = self.sessions.lock().unwrap().get(key) {
-            return Ok(id.clone());
+    fn session_for(&self, key: &str) -> AdapterResult<DuckFleetSession> {
+        if let Some(session) = self.sessions.lock().unwrap().get(key) {
+            return Ok(session.clone());
         }
         let compute = self
             .pending_compute
@@ -219,8 +226,26 @@ impl DuckFleetSidecarClient {
             self.close_session_id(&session_id);
             return Ok(existing);
         }
-        sessions.insert(key.to_string(), session_id.clone());
-        Ok(session_id)
+        let session = DuckFleetSession {
+            id: session_id,
+            execution: Arc::new(Mutex::new(())),
+        };
+        sessions.insert(key.to_string(), session.clone());
+        Ok(session)
+    }
+
+    fn with_session<T>(&self, session: &DuckFleetSession, operation: impl FnOnce(&str) -> T) -> T {
+        let _execution = session.execution.lock().unwrap();
+        operation(&session.id)
+    }
+
+    fn run_session(
+        &self,
+        session: &DuckFleetSession,
+        sql: &str,
+        fetch: bool,
+    ) -> AdapterResult<Option<RecordBatch>> {
+        self.with_session(session, |session_id| self.run_query(session_id, sql, fetch))
     }
 
     /// Run one statement on `session_id`. `fetch = false` still executes the
@@ -283,8 +308,8 @@ impl DuckFleetSidecarClient {
 
     /// Run a statement on the persistent metadata session (used by introspection).
     fn run_metadata(&self, sql: &str) -> AdapterResult<RecordBatch> {
-        let session_id = self.session_for("")?;
-        match self.run_query(&session_id, sql, true) {
+        let session = self.session_for("")?;
+        match self.run_session(&session, sql, true) {
             Ok(Some(batch)) => Ok(batch),
             Ok(None) => Err(AdapterError::new(
                 AdapterErrorKind::UnexpectedResult,
@@ -303,9 +328,9 @@ impl DuckFleetSidecarClient {
     /// Route `COMMIT`/`ROLLBACK` (or a cancel/close) for a node's session, if open.
     fn control(&self, node_id: &Option<String>, statement: &str) -> AdapterResult<()> {
         let key = node_id.clone().unwrap_or_default();
-        let session_id = { self.sessions.lock().unwrap().get(&key).cloned() };
-        if let Some(session_id) = session_id {
-            self.run_query(&session_id, statement, false)?;
+        let session = { self.sessions.lock().unwrap().get(&key).cloned() };
+        if let Some(session) = session {
+            self.run_session(&session, statement, false)?;
         }
         Ok(())
     }
@@ -313,10 +338,10 @@ impl DuckFleetSidecarClient {
     fn cancel_node(&self, node_id: &Option<String>) {
         let key = node_id.clone().unwrap_or_default();
         let session_id = { self.sessions.lock().unwrap().get(&key).cloned() };
-        if let Some(session_id) = session_id {
+        if let Some(session) = session_id {
             let _ = self
                 .agent
-                .post(self.url(&format!("/v1/sessions/{session_id}/cancel")))
+                .post(self.url(&format!("/v1/sessions/{}/cancel", session.id)))
                 .header("Authorization", &self.auth_header)
                 .send_empty();
         }
@@ -325,9 +350,10 @@ impl DuckFleetSidecarClient {
     /// Close a node's gateway session (freeing its worker/isolated pod), if open.
     fn close_node(&self, node_id: &Option<String>) {
         let key = node_id.clone().unwrap_or_default();
-        let session_id = { self.sessions.lock().unwrap().remove(&key) };
-        if let Some(session_id) = session_id {
-            self.close_session_id(&session_id);
+        let session = { self.sessions.lock().unwrap().remove(&key) };
+        if let Some(session) = session {
+            let _execution = session.execution.lock().unwrap();
+            self.close_session_id(&session.id);
         }
     }
 }
@@ -340,8 +366,8 @@ impl SidecarClient for DuckFleetSidecarClient {
         fetch: bool,
     ) -> AdapterResult<Option<RecordBatch>> {
         let key = ctx.node_id().cloned().unwrap_or_default();
-        let session_id = self.session_for(&key)?;
-        match self.run_query(&session_id, sql, fetch) {
+        let session = self.session_for(&key)?;
+        match self.run_session(&session, sql, fetch) {
             Ok(result) => Ok(result),
             Err(err) => {
                 if err.sqlstate().starts_with("08") {
@@ -383,12 +409,13 @@ impl SidecarClient for DuckFleetSidecarClient {
     }
 
     fn shutdown(&self) -> AdapterResult<()> {
-        let sessions: Vec<String> = {
+        let sessions: Vec<DuckFleetSession> = {
             let mut map = self.sessions.lock().unwrap();
             map.drain().map(|(_, v)| v).collect()
         };
-        for session_id in sessions {
-            self.close_session_id(&session_id);
+        for session in sessions {
+            let _execution = session.execution.lock().unwrap();
+            self.close_session_id(&session.id);
         }
         Ok(())
     }
@@ -585,9 +612,12 @@ impl DuckFleetStatement {
                 adbc_core::error::Status::InvalidState,
             )
         })?;
-        let session_id = self.client.session_for(&self.key).map_err(adapter_to_adbc)?;
+        let session = self
+            .client
+            .session_for(&self.key)
+            .map_err(adapter_to_adbc)?;
         self.client
-            .run_query(&session_id, &sql, fetch)
+            .run_session(&session, &sql, fetch)
             .map_err(adapter_to_adbc)
     }
 }
@@ -863,4 +893,65 @@ fn adapter_to_adbc(err: AdapterError) -> adbc_core::error::Error {
         err.to_string(),
         adbc_core::error::Status::Internal,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    fn session(id: &str) -> DuckFleetSession {
+        DuckFleetSession {
+            id: id.to_string(),
+            execution: Arc::new(Mutex::new(())),
+        }
+    }
+
+    #[test]
+    fn one_session_executes_one_statement_at_a_time() {
+        let client = DuckFleetSidecarClient::new("http://unused", "token");
+        let session = session("shared");
+        let start = Barrier::new(2);
+        let active = AtomicUsize::new(0);
+        let maximum = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    start.wait();
+                    client.with_session(&session, |_| {
+                        let current = active.fetch_add(1, Ordering::Relaxed) + 1;
+                        maximum.fetch_max(current, Ordering::Relaxed);
+                        thread::sleep(Duration::from_millis(25));
+                        active.fetch_sub(1, Ordering::Relaxed);
+                    });
+                });
+            }
+        });
+        assert_eq!(maximum.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn separate_sessions_execute_concurrently() {
+        let client = DuckFleetSidecarClient::new("http://unused", "token");
+        let sessions = [session("first"), session("second")];
+        let start = Barrier::new(2);
+        let active = AtomicUsize::new(0);
+        let maximum = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            for session in &sessions {
+                scope.spawn(|| {
+                    start.wait();
+                    client.with_session(session, |_| {
+                        let current = active.fetch_add(1, Ordering::Relaxed) + 1;
+                        maximum.fetch_max(current, Ordering::Relaxed);
+                        thread::sleep(Duration::from_millis(25));
+                        active.fetch_sub(1, Ordering::Relaxed);
+                    });
+                });
+            }
+        });
+        assert_eq!(maximum.load(Ordering::Relaxed), 2);
+    }
 }
