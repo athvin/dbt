@@ -1,0 +1,7 @@
+kind: Under the Hood
+body: Build DuckFleet adapter releases on native x86_64 and ARM64 runners
+time: 2026-11-25T11:50:25.406365-08:00
+custom:
+    author: athvin
+    issue: ""
+    project: dbt-core
