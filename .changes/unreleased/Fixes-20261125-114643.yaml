@@ -1,0 +1,7 @@
+kind: Fixes
+body: Serialize execution within each DuckFleet session to prevent session_busy races
+time: 2026-11-25T11:46:43.757769-08:00
+custom:
+    author: athvin
+    issue: ""
+    project: dbt-core
