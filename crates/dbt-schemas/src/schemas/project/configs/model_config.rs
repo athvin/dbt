@@ -445,6 +445,15 @@ pub struct ProjectModelConfig {
         deserialize_with = "bool_or_string_bool"
     )]
     pub use_anonymous_sproc: Option<bool>,
+    /// Whether the models are written in MetricFlow SQL. It is read only while the
+    /// `metricflow_v2` flag is on, and is not in the published JSON schema.
+    #[serde(
+        default,
+        rename = "+metricflow",
+        deserialize_with = "bool_or_string_bool"
+    )]
+    #[schemars(skip)]
+    pub metricflow: Option<bool>,
     #[serde(rename = "+partition_by")]
     pub partition_by: Option<PartitionConfig>,
     /// Exasol: PARTITION BY column list (name matches the Python dbt-exasol adapter)
@@ -808,6 +817,7 @@ impl TypedRecursiveConfig for ProjectModelConfig {
             || self.secrets.is_some()
             || self.external_access_integrations.is_some()
             || self.use_anonymous_sproc.is_some()
+            || self.metricflow.is_some()
             || self.partition_by.is_some()
             || self.partition_expiration_days.is_some()
             || self.partitions.is_some()
@@ -934,6 +944,15 @@ pub struct ModelConfig {
     pub external_access_integrations: Option<StringOrArrayOfStrings>,
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub use_anonymous_sproc: Option<bool>,
+    /// Whether the model is written in MetricFlow SQL. It is read only while the `metricflow_v2`
+    /// flag is on, and is not in the published JSON schema.
+    #[serde(
+        default,
+        deserialize_with = "bool_or_string_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(skip)]
+    pub metricflow: Option<bool>,
     pub contract: Option<DbtContract>,
     #[serde(default, deserialize_with = "event_time_or_map_to_string")]
     pub event_time: Option<String>,
@@ -1047,6 +1066,7 @@ impl From<ProjectModelConfig> for ModelConfig {
             secrets: config.secrets,
             external_access_integrations: config.external_access_integrations,
             use_anonymous_sproc: config.use_anonymous_sproc,
+            metricflow: config.metricflow,
             persist_docs: config.persist_docs,
             post_hook: config.post_hook,
             pre_hook: config.pre_hook,
@@ -1268,6 +1288,7 @@ impl From<ModelConfig> for ProjectModelConfig {
             secrets: config.secrets,
             external_access_integrations: config.external_access_integrations,
             use_anonymous_sproc: config.use_anonymous_sproc,
+            metricflow: config.metricflow,
             persist_docs: config.persist_docs,
             post_hook: config.post_hook,
             pre_hook: config.pre_hook,
@@ -1587,6 +1608,8 @@ impl ModelConfig {
         let sql_header_eq = self.sql_header == other.sql_header;
         let location_eq = self.location == other.location;
         let predicates_eq = self.predicates == other.predicates;
+        // A model without the config is not written in MetricFlow SQL, as one with `false`.
+        let metricflow_eq = self.metricflow.unwrap_or(false) == other.metricflow.unwrap_or(false);
         let warehouse_config_eq = same_warehouse_config(
             &self.__warehouse_specific_config__,
             &other.__warehouse_specific_config__,
@@ -1629,6 +1652,7 @@ impl ModelConfig {
             && sql_header_eq
             && location_eq
             && predicates_eq
+            && metricflow_eq
             && warehouse_config_eq;
 
         if !result {
@@ -1895,6 +1919,14 @@ impl ModelConfig {
                         Some((
                             format!("{:?}", &self.predicates),
                             format!("{:?}", &other.predicates),
+                        )),
+                    ),
+                    (
+                        "metricflow",
+                        metricflow_eq,
+                        Some((
+                            format!("{:?}", &self.metricflow),
+                            format!("{:?}", &other.metricflow),
                         )),
                     ),
                     ("warehouse_config", warehouse_config_eq, None),
@@ -2328,8 +2360,10 @@ __additional_properties__: {}
             Some(OnConfigurationChange::Apply)
         );
 
-        let manifest: ManifestModelConfig =
-            dbt_yaml::from_str("__warehouse_specific_config__: {}\n").unwrap();
+        let manifest: ManifestModelConfig = dbt_yaml::from_str(
+            "__rare_freshness__: {}\n__rare_python__: {}\n__warehouse_specific_config__: {}\n",
+        )
+        .unwrap();
         let mut manifest_runtime: ModelConfig = manifest.into();
         assert_eq!(manifest_runtime.on_configuration_change, None);
         manifest_runtime.apply_resolve_defaults((StaticAnalysisKind::default(), None, None));
@@ -2430,6 +2464,21 @@ __warehouse_specific_config__: {}
         assert_eq!(state.ignore_external_modifications, Some(true));
     }
 
+    #[test]
+    fn test_model_config_state_parses_pre_clone_if_changed() {
+        let config: ModelConfig = dbt_yaml::from_str(
+            r#"
+state:
+  pre_clone: if_changed
+__warehouse_specific_config__: {}
+"#,
+        )
+        .unwrap();
+
+        let state = config.state.expect("state config should parse");
+        assert_eq!(state.pre_clone, Some(StatePreClone::IfChanged));
+    }
+
     /// Regression for #16135: `state:` keys merge key by key, so a model that sets
     /// only `require_fresh_data_from` still inherits the project-level `lag_tolerance`.
     #[test]
@@ -2450,6 +2499,7 @@ __warehouse_specific_config__: {}
                 execute_hooks_on_any_reuse: None,
                 compare_unrendered_code: None,
                 ignore_external_modifications: Some(true),
+                compare_selected_columns: None,
             }),
             ..Default::default()
         };
@@ -2462,6 +2512,7 @@ __warehouse_specific_config__: {}
                 execute_hooks_on_any_reuse: None,
                 compare_unrendered_code: None,
                 ignore_external_modifications: None,
+                compare_selected_columns: None,
             }),
             ..Default::default()
         };
@@ -2600,6 +2651,8 @@ __warehouse_specific_config__: {}
         let config: ManifestModelConfig = dbt_yaml::from_str(
             r#"
 python_version: 3.10
+__rare_freshness__: {}
+__rare_python__: {}
 __warehouse_specific_config__: {}
 "#,
         )

@@ -7,6 +7,10 @@ use crate::renderer::{
     RenderCtx, RenderCtxInner, SqlFileRenderResult, collect_adapter_identifiers_detect_unsafe,
     render_unresolved_sql_files, strip_deprecated_warehouse_keys_from_properties,
 };
+use crate::resolve::injected_properties::{
+    self, InjectedPropertiesByKind, InjectedPropertiesReader, NoInjectedPropertiesByKind,
+    ReadInjectedProperties,
+};
 use crate::resolve::resolvable_node::{ResolvableNode, ResolveCtx};
 use crate::resolve::resolve_tests::persist_generic_data_tests::TestableNodeTrait;
 use crate::resolve::resolve_tests::persist_generic_data_tests::{
@@ -61,14 +65,22 @@ use minijinja::Value as MinijinjaValue;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// How a package's snapshots resolve.
-pub(crate) struct Snapshots;
+/// How a package's snapshots resolve. `P` names the properties that are injected into the
+/// entries of snapshots.
+pub(crate) struct Snapshots<P = NoInjectedPropertiesByKind>(PhantomData<P>);
+
+impl<P> Default for Snapshots<P> {
+    fn default() -> Self {
+        Snapshots(PhantomData)
+    }
+}
 
 #[async_trait]
-impl ResolvableNode for Snapshots {
+impl<P: InjectedPropertiesByKind> ResolvableNode for Snapshots<P> {
     fn properties_keys(&self) -> &'static [&'static str] {
         &["snapshots"]
     }
@@ -78,7 +90,8 @@ impl ResolvableNode for Snapshots {
         // instead of receiving the top-level one, so snapshot macro dependencies are populated
         // locally rather than via update_manifest_with_macro_depends_on. Out of scope for now.
         // Resolve snapshots based on the dbt_state, database, schema, and project name
-        let (snapshots, disabled_snapshots) = resolve_snapshots(
+        let injected = InjectedPropertiesReader::of::<P::Snapshot>(ctx);
+        let (snapshots, disabled_snapshots, injected) = resolve_snapshots(
             ctx.arg,
             ctx.package,
             ctx.package_quoting,
@@ -100,11 +113,14 @@ impl ResolvableNode for Snapshots {
             ctx.test_name_truncations,
             ctx.seen_generic_test_paths,
             ctx.token,
+            &injected,
         )
         .await?;
         ctx.nodes.snapshots.extend(snapshots);
         ctx.disabled_nodes.snapshots.extend(disabled_snapshots);
-        Ok(())
+        injected_properties::give_back(ctx, injected, |ctx, unique_id| {
+            ctx.nodes.snapshots.get(unique_id).cloned()
+        })
     }
 }
 
@@ -131,10 +147,14 @@ pub async fn resolve_snapshots(
     test_name_truncations: &mut HashMap<String, String>,
     seen_generic_test_paths: &mut HashMap<PathBuf, String>,
     token: &CancellationToken,
+    injected: &InjectedPropertiesReader,
 ) -> FsResult<(
     HashMap<String, Arc<DbtSnapshot>>,
     HashMap<String, Arc<DbtSnapshot>>,
+    Vec<(String, ReadInjectedProperties)>,
 )> {
+    // The injected properties of each snapshot whose entry has some, by the snapshot's unique id.
+    let mut read_injected: Vec<(String, ReadInjectedProperties)> = Vec::new();
     let mut snapshots: HashMap<String, Arc<DbtSnapshot>> = HashMap::new();
     let mut disabled_snapshots: HashMap<String, Arc<DbtSnapshot>> = HashMap::new();
     let jinja_type_checking_event_listener_factory =
@@ -270,6 +290,15 @@ pub async fn resolve_snapshots(
             // still go through Jinja as before.
             let raw_description =
                 yaml_field_utils::detach_field_from_mapping(&mut schema_value, "description");
+            // Read before the entry is typed as a snapshot's.
+            if let Some(read) = injected.read(
+                &mut schema_value,
+                &jinja_env,
+                base_ctx.as_ref(),
+                dependency_package_name,
+            )? {
+                read_injected.push((format!("snapshot.{package_name}.{snapshot_name}"), read));
+            }
             let mut snapshot: SnapshotProperties = into_typed_with_jinja(
                 schema_value,
                 false,
@@ -829,7 +858,7 @@ pub async fn resolve_snapshots(
             .map(|(k, _)| (k.__common_attr__.unique_id.clone(), Arc::new(k))),
     );
 
-    Ok((snapshots, disabled_snapshots))
+    Ok((snapshots, disabled_snapshots, read_injected))
 }
 
 /// Extract the verbatim body between `{% snapshot ... %}` and `{% endsnapshot %}`

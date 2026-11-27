@@ -1,3 +1,5 @@
+/// Fields that a build of dbt reads beside a node's own properties
+pub mod injected_properties;
 /// Utilities for inferring model primary keys from constraints and tests
 pub(crate) mod primary_key_inference;
 /// The properties files of one package

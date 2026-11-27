@@ -13,6 +13,10 @@ use crate::renderer::SqlFileRenderResult;
 use crate::renderer::collect_adapter_identifiers_detect_unsafe;
 use crate::renderer::render_unresolved_sql_files;
 use crate::renderer::strip_deprecated_warehouse_keys_from_properties;
+use crate::resolve::injected_properties::{
+    self, InjectedPropertiesByKind, InjectedPropertiesReader, NoInjectedPropertiesByKind,
+    ReadInjectedProperties,
+};
 use crate::resolve::properties_index::{IndexCtx, IndexedName};
 use crate::resolve::resolvable_node::{ResolvableNode, ResolveCtx};
 use crate::resolve::resolve_utils::RawProjectConfigsByAdapter;
@@ -94,6 +98,7 @@ use dbt_yaml::Spanned;
 use minijinja::constants::CURRENT_PATH;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -163,11 +168,18 @@ fn parse_source_from_constraint(to: &str) -> Option<(String, String)> {
     Some((src.to_string(), tbl.to_string()))
 }
 
-/// How a package's models resolve.
-pub(crate) struct Models;
+/// How a package's models resolve. `P` names the properties that are injected into the
+/// entries of models.
+pub(crate) struct Models<P = NoInjectedPropertiesByKind>(PhantomData<P>);
+
+impl<P> Default for Models<P> {
+    fn default() -> Self {
+        Models(PhantomData)
+    }
+}
 
 #[async_trait]
-impl ResolvableNode for Models {
+impl<P: InjectedPropertiesByKind> ResolvableNode for Models<P> {
     fn properties_keys(&self) -> &'static [&'static str] {
         &["models"]
     }
@@ -183,8 +195,9 @@ impl ResolvableNode for Models {
     }
 
     async fn resolve(&self, ctx: &mut ResolveCtx<'_>) -> FsResult<()> {
+        let injected = InjectedPropertiesReader::of::<P::Model>(ctx);
         // Resolve SQLs and get nodes except refs and sources
-        let (models, disabled_models) = resolve_models(
+        let (models, disabled_models, injected) = resolve_models(
             ctx.arg,
             ctx.package,
             ctx.package_quoting,
@@ -208,11 +221,14 @@ impl ResolvableNode for Models {
             &mut ctx.node_resolver,
             ctx.token,
             ctx.jinja_type_checking_event_listener_factory.clone(),
+            &injected,
         )
         .await?;
         ctx.nodes.models.extend(models);
         ctx.disabled_nodes.models.extend(disabled_models);
-        Ok(())
+        injected_properties::give_back(ctx, injected, |ctx, unique_id| {
+            ctx.nodes.models.get(unique_id).cloned()
+        })
     }
 }
 
@@ -248,9 +264,11 @@ pub async fn resolve_models(
     node_resolver: &mut NodeResolver,
     token: &CancellationToken,
     jinja_type_checking_event_listener_factory: Arc<dyn JinjaTypeCheckingEventListenerFactory>,
+    injected: &InjectedPropertiesReader,
 ) -> FsResult<(
     HashMap<String, Arc<DbtModel>>,
     HashMap<String, Arc<DbtModel>>,
+    Vec<(String, ReadInjectedProperties)>,
 )> {
     let mut models: HashMap<String, Arc<DbtModel>> = HashMap::new();
     let mut models_with_execute: HashMap<String, DbtModel> = HashMap::new();
@@ -362,6 +380,20 @@ pub async fn resolve_models(
         NodeType::Model,
         dependency_package_name,
     );
+
+    // The injected properties of each entry that has some, by the name the entry is found under, which is
+    // the name of its model's file. They are read before the entry is typed as a model's.
+    let mut injected_by_name: Vec<(String, ReadInjectedProperties)> = Vec::new();
+    for (name, mpe) in models_properties_sans_semantics.iter_mut() {
+        if let Some(read) = injected.read(
+            &mut mpe.schema_value,
+            &env,
+            base_ctx,
+            dependency_package_name,
+        )? {
+            injected_by_name.push((name.clone(), read));
+        }
+    }
 
     // Split SQL and Python models for different processing paths
     let (sql_files, python_files): (Vec<_>, Vec<_>) =
@@ -518,7 +550,24 @@ pub async fn resolve_models(
             .into_iter()
             .map(|(v, _)| (v.__common_attr__.unique_id.to_string(), Arc::new(v))),
     );
-    Ok((models, disabled_models))
+    // Injected properties are their model's: the enabled model whose file has the entry's name.
+    let unique_ids: HashMap<&str, &String> = models
+        .iter()
+        .filter_map(|(unique_id, model)| {
+            Some((
+                node_name_from_path(model.__common_attr__.path.as_path())?,
+                unique_id,
+            ))
+        })
+        .collect();
+    let injected = injected_by_name
+        .into_iter()
+        .filter_map(|(name, read)| {
+            let unique_id = unique_ids.get(name.as_str())?;
+            Some(((*unique_id).clone(), read))
+        })
+        .collect();
+    Ok((models, disabled_models, injected))
 }
 
 /// Builds a `DbtModel` node for each rendered model file, routing it into `models`,

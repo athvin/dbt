@@ -20,7 +20,11 @@ use std::{
 };
 
 #[cfg(debug_assertions)]
-use {crate::env_var::env_var_bool, std::io::ErrorKind, std::process::Command};
+use {
+    crate::env_var::env_var_bool,
+    std::io::{self, ErrorKind},
+    std::process::Command,
+};
 
 mod builder;
 pub use builder::*;
@@ -220,7 +224,16 @@ impl<'a> fmt::Display for DriverFilenameDisplay<'a> {
 /// is unset.
 #[cfg(debug_assertions)]
 fn rebuild_drivers(dir: &PathBuf) -> Result<()> {
-    let needs_rebuild = match Command::new("make").arg("-C").arg(dir).arg("-q").status() {
+    // `-C` makes `make` print "Entering directory" lines, and the recipes echo
+    // their commands. Keep `dbt`'s output (which tests compare against goldies)
+    // free of them: only a failed build prints anything, to stderr.
+    let needs_rebuild = match Command::new("make")
+        .arg("--no-print-directory")
+        .arg("-C")
+        .arg(dir)
+        .arg("-q")
+        .status()
+    {
         Ok(s) => s.code() == Some(1),
         Err(e) if e.kind() == ErrorKind::NotFound => {
             eprintln!("`make` not found, skipping rebuild");
@@ -236,8 +249,11 @@ fn rebuild_drivers(dir: &PathBuf) -> Result<()> {
 
     if needs_rebuild {
         let status = Command::new("make")
+            .arg("--silent")
+            .arg("--no-print-directory")
             .arg("-C")
             .arg(dir)
+            .stdout(io::stderr())
             .status()
             .expect("failed to spawn `make`");
 
@@ -299,6 +315,12 @@ fn find_bundled_drivers_cache_dir() -> Option<PathBuf> {
 // Cache directory found by climbing up from the executable (read-only).
 static BUNDLED_DRIVERS_CACHE_DIR: LazyLock<Option<PathBuf>> =
     LazyLock::new(find_bundled_drivers_cache_dir);
+
+/// The read-only cache directory next to the executable, e.g. `<prefix>/drivers/` for
+/// `<prefix>/bin/dbt`, if there is one. It is laid out as the OS cache directory is.
+pub fn bundled_cache_dir() -> Option<&'static Path> {
+    BUNDLED_DRIVERS_CACHE_DIR.as_deref()
+}
 
 /// Climb up the directory tree and returns the first lib/dbt/ directory found.
 ///
