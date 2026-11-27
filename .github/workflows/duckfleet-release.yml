@@ -22,15 +22,25 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-linux:
+  build:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: x86_64
+          - os: linux
+            arch: x86_64
             runner: ubuntu-latest
-          - arch: aarch64
+          - os: linux
+            arch: aarch64
             runner: ubuntu-24.04-arm
+          # Native macOS builds, so dbt installs with Homebrew and runs directly
+          # on a developer's machine rather than inside a Linux container.
+          - os: darwin
+            arch: aarch64
+            runner: macos-latest
+          - os: darwin
+            arch: x86_64
+            runner: macos-15-intel
     runs-on: ${{ matrix.runner }}
     env:
       # The workspace pins arrow/datafusion/ring to sdf-labs git forks; fetch
@@ -43,11 +53,17 @@ jobs:
       # dbt-state's build script compiles the query-cache .proto files via
       # prost-build, which shells out to `protoc`. It is the only native build
       # tool the workspace needs (no cmake; rustls uses ring, not aws-lc).
-      - name: Install protoc
+      - name: Install protoc (Linux)
+        if: matrix.os == 'linux'
         # protobuf-compiler ships the `protoc` binary; libprotobuf-dev ships the
         # well-known-type .proto files (google/protobuf/*.proto) under /usr/include
         # that dbt-state's protos import — protoc finds them on its default include path.
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+
+      - name: Install protoc (macOS)
+        if: matrix.os == 'darwin'
+        # Homebrew's protobuf carries both protoc and the well-known-type protos.
+        run: brew install protobuf
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -55,7 +71,7 @@ jobs:
         with:
           # One cache for this workflow; the arrow/datafusion forks dominate the
           # build, so sharing across runs turns the ~45 min cold build into minutes.
-          shared-key: duckfleet-release-linux-${{ matrix.arch }}
+          shared-key: duckfleet-release-${{ matrix.os }}-${{ matrix.arch }}
 
       - name: Build dbt (release)
         run: cargo build --release --locked --bin dbt
@@ -67,14 +83,16 @@ jobs:
           mkdir -p dist
           strip target/release/dbt
           "target/release/dbt" --version > dist/dbt.version || echo "unknown" > dist/dbt.version
-          tar -C target/release -czf "dist/dbt-linux-${{ matrix.arch }}.tar.gz" dbt
-          ( cd dist && sha256sum "dbt-linux-${{ matrix.arch }}.tar.gz" > "dbt-linux-${{ matrix.arch }}.tar.gz.sha256" )
+          name="dbt-${{ matrix.os }}-${{ matrix.arch }}.tar.gz"
+          tar -C target/release -czf "dist/$name" dbt
+          # sha256sum on Linux, shasum on macOS; both write the same `<hash>  <file>` line.
+          ( cd dist && if command -v sha256sum > /dev/null; then sha256sum "$name"; else shasum -a 256 "$name"; fi > "$name.sha256" )
           ls -l dist
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dbt-linux-${{ matrix.arch }}
+          name: dbt-${{ matrix.os }}-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
 
@@ -83,5 +101,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/dbt-linux-${{ matrix.arch }}.tar.gz
-            dist/dbt-linux-${{ matrix.arch }}.tar.gz.sha256
+            dist/dbt-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
+            dist/dbt-${{ matrix.os }}-${{ matrix.arch }}.tar.gz.sha256
