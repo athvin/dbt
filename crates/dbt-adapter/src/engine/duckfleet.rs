@@ -61,8 +61,8 @@ use uuid::Uuid;
 
 use adbc_core::PartitionedResult;
 use adbc_core::options::{OptionStatement, OptionValue};
-use dbt_adbc::{Connection, QueryCtx, Statement};
 use dbt_adapter_engine::sidecar_client::{ColumnInfo, SidecarClient};
+use dbt_adbc::{Connection, QueryCtx, Statement};
 use dbt_common::error::{AdapterError, AdapterErrorKind, AdapterResult};
 use dbt_schemas::dbt_types::RelationType;
 use dbt_schemas::schemas::common::ResolvedQuoting;
@@ -95,6 +95,11 @@ pub struct DuckFleetSidecarClient {
     /// node_id -> the `compute` JSON resolved from that node's `meta.platform`,
     /// captured in `new_connection` and consumed the first time the session opens.
     pending_compute: Mutex<HashMap<String, JsonValue>>,
+    /// The dbt `invocation_id`, learned from the first `State`/`QueryCtx` that
+    /// carries one. Until then (or if dbt never supplies one) sessions use
+    /// `fallback_invocation_id`, a UUID minted for this client (one per process).
+    invocation_id: Mutex<Option<String>>,
+    fallback_invocation_id: String,
     /// A weak handle to self, so `new_connection` can hand an owned `Arc` to the
     /// returned [`DuckFleetConnection`] (which needs to call back for
     /// commit/rollback/cancel/close).
@@ -128,8 +133,29 @@ impl DuckFleetSidecarClient {
             agent,
             sessions: Mutex::new(HashMap::new()),
             pending_compute: Mutex::new(HashMap::new()),
+            invocation_id: Mutex::new(None),
+            fallback_invocation_id: uuid::Uuid::new_v4().to_string(),
             me: me.clone(),
         })
+    }
+
+    /// Remember dbt's invocation id the first time one is seen.
+    fn learn_invocation_id(&self, invocation_id: Option<&str>) {
+        let Some(id) = invocation_id.filter(|id| !id.is_empty()) else {
+            return;
+        };
+        let mut slot = self.invocation_id.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(id.to_string());
+        }
+    }
+
+    fn current_invocation_id(&self) -> String {
+        self.invocation_id
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| self.fallback_invocation_id.clone())
     }
 
     fn url(&self, suffix: &str) -> String {
@@ -140,10 +166,14 @@ impl DuckFleetSidecarClient {
     /// and return its `session_id`, retrying transient placement/transport
     /// refusals until [`OPEN_RETRY_SECS`] elapses.
     fn open_session(&self, connection_name: &str, compute: JsonValue) -> AdapterResult<String> {
-        let body = json!({
-            "compute": compute,
-            "context": { "connection_name": connection_name, "dbt": { "node_id": connection_name } },
-        });
+        // One session = one node execution, so a fresh model_run_id per open.
+        let model_run_id = (connection_name != "dbt").then(|| uuid::Uuid::new_v4().to_string());
+        let body = session_open_body(
+            connection_name,
+            compute,
+            &self.current_invocation_id(),
+            model_run_id.as_deref(),
+        );
         let started = Instant::now();
         loop {
             match self
@@ -365,6 +395,7 @@ impl SidecarClient for DuckFleetSidecarClient {
         sql: &str,
         fetch: bool,
     ) -> AdapterResult<Option<RecordBatch>> {
+        self.learn_invocation_id(ctx.run_id().map(String::as_str));
         let key = ctx.node_id().cloned().unwrap_or_default();
         let session = self.session_for(&key)?;
         match self.run_session(&session, sql, fetch) {
@@ -385,6 +416,7 @@ impl SidecarClient for DuckFleetSidecarClient {
         node_id: Option<String>,
     ) -> AdapterResult<Box<dyn Connection>> {
         let key = node_id.clone().unwrap_or_default();
+        self.learn_invocation_id(invocation_id_from_state(state).as_deref());
         let compute = compute_from_state(state);
         self.pending_compute.lock().unwrap().insert(key, compute);
         let client = self.me.upgrade().ok_or_else(|| {
@@ -398,6 +430,7 @@ impl SidecarClient for DuckFleetSidecarClient {
 
     fn note_compute(&self, node_id: Option<&str>, state: Option<&State>) {
         let key = node_id.unwrap_or_default().to_string();
+        self.learn_invocation_id(invocation_id_from_state(state).as_deref());
         // Learn the size only until the node's session is open; once it is, the pod is
         // fixed for the node's lifetime, and a later statement whose state carries a
         // thinner config must not be read as a downgrade.
@@ -726,6 +759,32 @@ impl Drop for DuckFleetConnection {
 /// present → an isolated pod of that size; none present → `{}` → the persistent
 /// tier. This mirrors the server's own presence rule exactly; non-resource keys
 /// under `platform` (e.g. `tags`) are dropped, as the Python adapter did.
+/// The `POST /v1/sessions` body. The gateway records `context` on every
+/// statement of the session in `query_history`: `dbt.node_id` becomes
+/// `model_id`, `dbt.invocation_id` groups one `dbt build`, and the top-level
+/// `model_run_id` identifies this one execution of the node.
+fn session_open_body(
+    connection_name: &str,
+    compute: JsonValue,
+    invocation_id: &str,
+    model_run_id: Option<&str>,
+) -> JsonValue {
+    let mut context = json!({
+        "connection_name": connection_name,
+        "dbt": { "node_id": connection_name, "invocation_id": invocation_id },
+    });
+    if let Some(run) = model_run_id {
+        context["model_run_id"] = json!(run);
+    }
+    json!({ "compute": compute, "context": context })
+}
+
+fn invocation_id_from_state(state: Option<&State>) -> Option<String> {
+    state?
+        .lookup("invocation_id", &[])
+        .and_then(|value| value.as_str().map(str::to_string))
+}
+
 fn compute_from_state(state: Option<&State>) -> JsonValue {
     let Some(state) = state else {
         return json!({});
@@ -802,8 +861,13 @@ struct GatewayFailure {
 impl GatewayFailure {
     /// Whether an open should keep waiting rather than fail: the gateway is
     /// draining/starting or a proxy returned 502/503/504.
+    /// Refusals of a session open that executed nothing and clear on their own:
+    /// a draining or starting gateway, a gateway at capacity, or a proxy error.
     fn waitable_on_open(&self) -> bool {
-        matches!(self.kind.as_deref(), Some("draining") | Some("starting"))
+        matches!(
+            self.kind.as_deref(),
+            Some("draining") | Some("starting") | Some("capacity")
+        )
             || matches!(self.status, 502..=504)
     }
 
@@ -820,11 +884,15 @@ impl GatewayFailure {
                 // engine's thread-local cache discards it.
                 (AdapterErrorKind::Driver, Some(*b"08003"))
             }
-            Some("compute_unavailable") | Some("budget_exhausted") | Some("budget_job_cost")
-            | Some("budget_exceeded") | Some("invalid_request") => {
-                (AdapterErrorKind::Configuration, None)
-            }
-            Some("capacity") | Some("draining") | Some("starting") | Some("unavailable")
+            Some("compute_unavailable")
+            | Some("budget_exhausted")
+            | Some("budget_job_cost")
+            | Some("budget_exceeded")
+            | Some("invalid_request") => (AdapterErrorKind::Configuration, None),
+            Some("capacity")
+            | Some("draining")
+            | Some("starting")
+            | Some("unavailable")
             | Some("not_placeable") => (AdapterErrorKind::Driver, Some(*b"08006")),
             _ => (AdapterErrorKind::Driver, None),
         };
@@ -907,6 +975,29 @@ mod tests {
             id: id.to_string(),
             execution: Arc::new(Mutex::new(())),
         }
+    }
+
+    #[test]
+    fn open_body_carries_invocation_and_model_run_ids() {
+        let body = session_open_body("model.p.m", json!({"cpu": 2}), "inv-1", Some("run-1"));
+        assert_eq!(body["context"]["dbt"]["invocation_id"], "inv-1");
+        assert_eq!(body["context"]["dbt"]["node_id"], "model.p.m");
+        assert_eq!(body["context"]["model_run_id"], "run-1");
+        assert_eq!(body["compute"]["cpu"], 2);
+        let metadata = session_open_body("dbt", json!({}), "inv-1", None);
+        assert!(metadata["context"].get("model_run_id").is_none());
+    }
+
+    #[test]
+    fn dbt_invocation_id_wins_once_learned_and_sticks() {
+        let client = DuckFleetSidecarClient::new("http://unused", "token");
+        let fallback = client.current_invocation_id();
+        assert!(!fallback.is_empty());
+        client.learn_invocation_id(Some(""));
+        assert_eq!(client.current_invocation_id(), fallback);
+        client.learn_invocation_id(Some("dbt-inv"));
+        client.learn_invocation_id(Some("other"));
+        assert_eq!(client.current_invocation_id(), "dbt-inv");
     }
 
     #[test]
