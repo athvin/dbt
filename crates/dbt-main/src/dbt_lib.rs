@@ -8,6 +8,7 @@ use dbt_common::tracing::formatters::duration::FixedWidthDuration;
 use dbt_common::tracing::formatters::node::{NodeAction, NodeTypeFixedWidth};
 
 use dbt_adapter::load_store::ResultStore;
+use dbt_adapter::response::AdapterResponse;
 use dbt_adapter::{
     Adapter, convert_macro_result_to_record_batch,
     relation::{RelationObject, create_relation},
@@ -16,7 +17,7 @@ use dbt_clap_core::{
     Cli, Command, CompileArgs, CoreCommand, DocsServeArgs as ClapDocsServeArgs, DocsSubcommand,
     InternalCommand, LoginSubcommand, ProjectTemplate, ShowArgs, StateSubcommand,
 };
-use dbt_common::cancellation::CancellationToken;
+use dbt_common::cancellation::{CancellationToken, CancelledError};
 use dbt_common::io_utils::determine_project_dir;
 use dbt_common::{
     ErrorCode, FsResult,
@@ -26,7 +27,10 @@ use dbt_common::{
         INSTALLING, VALIDATING, default_index_dir, default_metadata_dir,
     },
     create_info_span, create_root_info_span, force_close_span, fs_err,
-    io_args::{DisplayFormat, EvalArgs, ListOutputFormat, Phases, ShowOptions, SystemArgs},
+    io_args::{
+        DisplayFormat, EvalArgs, ListOutputFormat, Phases, ShowOptions, SystemArgs,
+        project_flag_lookup,
+    },
     node_selector::IndirectSelection,
     path::get_target_write_path,
     pretty_string::{ColoredQuotes, GREEN, RED},
@@ -53,9 +57,10 @@ use dbt_dist::command::execute_get_distribution_info;
 use dbt_docs_server::providers::Backend;
 use dbt_features::feature_stack::FeatureStack;
 use dbt_index_core::backend::DuckDbInfoSchemaBackend;
+use dbt_index_core::info_schema::injected::ResolvedInjectedTable;
 use dbt_index_core::ingest::ingest_state::IngestState;
 use dbt_index_core::ingest::metadata_to_parquet::{apply_delta_direct, has_persisted_state};
-use dbt_index_core::write_info_schema;
+use dbt_index_core::write_info_schema_with_injected;
 use dbt_init::init;
 use dbt_jinja_utils::{
     jinja_environment::JinjaEnv, listener::JinjaTypeCheckingEventListenerFactory,
@@ -69,7 +74,7 @@ use dbt_schema_store::{DataStoreTrait, SchemaStoreTrait};
 use dbt_schemas::schemas::selection_override::{
     SAMPLE_CAP, format_sample, reconcile_reported_nodes, resolve_selection_override,
 };
-use dbt_schemas::schemas::{DbtCommandExecutionArtifacts, InvocationFacts};
+use dbt_schemas::schemas::{DbtCommandExecutionArtifacts, InvocationFacts, MetadataFlags};
 use dbt_schemas::{
     man::execute_man_command,
     schemas::legacy_catalog::{DbtCatalog, build_catalog},
@@ -107,7 +112,8 @@ use vortex_events::{
 use crate::{
     compilation::{
         DbtCustomScheduleDescription, DbtProjectCompilation, DbtProjectCompilationCacheChanges,
-        DbtRunTasksResult, DbtScheduleDescription, show_queries_info_schema, update_manifest,
+        DbtRunTasksResult, DbtScheduleDescription, RunTasksError, show_queries_info_schema,
+        update_manifest,
     },
     retry::{RETRIABLE_COMMANDS, RetryState},
     utils::{InvocationContext, write_runtime_results_parquet},
@@ -236,7 +242,8 @@ pub async fn setup_and_execute_fs(
 
     // Capture invocation context now — eval_arg.metadata_dir() is correctly resolved here.
     // Written at exit so every path (success / error / warm-parse / Ctrl+C) is covered.
-    let invocation_ctx = if eval_arg.write_metadata {
+    // A retry can turn metadata on after it starts, so capture the context for every retry.
+    let invocation_ctx = if eval_arg.write_metadata || eval_arg.command == FsCommand::Retry {
         let common = cli.common_args();
         Some(
             InvocationContext::new(
@@ -272,8 +279,14 @@ pub async fn setup_and_execute_fs(
     };
     record_span_status(&invocation_span, span_status.as_deref());
 
-    // Write invocation record — one place covers every exit path.
-    if let Some(ctx) = invocation_ctx {
+    // Write invocation record — one place covers every exit path. Gated on the flags the run
+    // used, which a retry can have turned on after it started.
+    let flags = artifacts_sink
+        .metadata_flags
+        .unwrap_or_else(|| metadata_flags(&eval_arg));
+    if let Some(ctx) = invocation_ctx
+        && flags.write_metadata
+    {
         // NoFilesChanged (warm parse, no-op) propagates via `?` as Err rather than Ok —
         // it's a "successful sentinel", not a real failure. exit_status() == Some(0)
         // catches it and ExitRepl; everything else with exit_status() == None is a real error.
@@ -286,7 +299,7 @@ pub async fn setup_and_execute_fs(
         // The row for this invocation only exists now, so any index or
         // information schema written during the command is missing it. Bring
         // that one table up to date.
-        refresh_invocation_artifacts(&eval_arg);
+        refresh_invocation_artifacts(&eval_arg, flags);
     }
 
     // Shutdown must be called to ensure vortex flushes all events.
@@ -353,7 +366,15 @@ fn invocation_facts(resolved_state: &ResolverState) -> InvocationFacts {
     }
 }
 
-/// Re-materialize the invocations table in whichever artifacts were requested,
+fn metadata_flags(arg: &EvalArgs) -> MetadataFlags {
+    MetadataFlags {
+        write_metadata: arg.write_metadata,
+        write_index: arg.write_index,
+        generate_info_schema: arg.generate_info_schema,
+    }
+}
+
+/// Re-materialize the invocations table in whichever artifacts `flags` turned on,
 /// once the current invocation's record has been written.
 ///
 /// `--write-index` and `--generate-info-schema` both produce their output while
@@ -371,13 +392,13 @@ fn invocation_facts(resolved_state: &ResolverState) -> InvocationFacts {
 ///
 /// Advisory, like the writes themselves: a failure here leaves the rest of the
 /// artifact usable and must not fail the command.
-fn refresh_invocation_artifacts(eval_arg: &EvalArgs) {
+fn refresh_invocation_artifacts(eval_arg: &EvalArgs, flags: MetadataFlags) {
     let metadata_dir = eval_arg.metadata_dir();
     if !metadata_dir.exists() {
         return;
     }
 
-    if eval_arg.generate_info_schema
+    if flags.generate_info_schema
         && let Err(err) =
             dbt_index_core::refresh_invocations(&metadata_dir, &eval_arg.info_schema_dir())
     {
@@ -387,7 +408,7 @@ fn refresh_invocation_artifacts(eval_arg: &EvalArgs) {
         );
     }
 
-    if eval_arg.write_index {
+    if flags.write_index {
         let index_dir = eval_arg.index_dir();
         if has_persisted_state(&index_dir)
             && let Err(err) = dbt_index_core::ingest::rewrite_invocations(&metadata_dir, &index_dir)
@@ -412,7 +433,7 @@ async fn do_execute_fs(
 
     warn_unused_engine_env_vars();
     warn_if_legacy_run_cache_mode_flag_used();
-    install_feature_flags(&cli.common_args().features, &feature_stack);
+    install_feature_flags(&cli.common_args().beta_features, &feature_stack);
 
     // Current versions of rustls require us to explicitly install a default provider.
     // The default provider can only be installed once per process, so
@@ -501,7 +522,7 @@ async fn do_execute_fs(
                 run_docs_serve(
                     serve_args.clone(),
                     &feature_stack,
-                    &eval_arg.io.in_dir,
+                    eval_arg,
                     &cli.common_args(),
                 )
                 .await
@@ -679,7 +700,8 @@ pub async fn execute_setup_and_all_phases(
     emit_version_info(eval_arg, feature_stack.cli.command_name)?;
 
     check_options(cli);
-    if let Err(e) = validate_engine_env_vars() {
+    let known_flags = feature_stack.injected_kinds.kinds.known_flags();
+    if let Err(e) = validate_engine_env_vars(&known_flags) {
         emit_error_log_from_fs_error(*e);
         return Err(FsError::exit_with_status(1));
     }
@@ -723,10 +745,12 @@ pub async fn execute_setup_and_all_phases(
 }
 
 /// Resolves this invocation's feature flags and makes them current. The flags that turn on the
-/// binary's experimentals are known flags too, though they aren't in `dbt_flags::ALL`.
-fn install_feature_flags(cli_features: &[String], feature_stack: &FeatureStack) {
-    let snapshot = dbt_flags::FlagSnapshot::builder().cli(cli_features).build();
-    let known = feature_stack.experimentals.experimentals.known_flags();
+/// binary's injected kinds are known flags too, though they aren't in `dbt_flags::ALL`.
+fn install_feature_flags(cli_beta_features: &[String], feature_stack: &FeatureStack) {
+    let snapshot = dbt_flags::FlagSnapshot::builder()
+        .cli(cli_beta_features)
+        .build();
+    let known = feature_stack.injected_kinds.kinds.known_flags();
     for warning in snapshot.warnings(&known) {
         emit_warn_log_message(ErrorCode::InvalidConfig, warning);
     }
@@ -975,6 +999,46 @@ impl<'a> AllPhasesExecutor<'a> {
         .await
     }
 
+    /// Writes run_results.json, and the runtime results parquet with `--write-metadata`, from the
+    /// run's stats. Written eagerly so that it persists even if post-execution steps
+    /// (did_run_tasks, update_manifest, save_build_cache, did_compile, etc.) fail before the late
+    /// write_json() call.
+    ///
+    /// Checks are not tasks, so their verdicts are not in the stats — `check_result_rows` are the
+    /// rows the gate produced, keyed `check.<project>.<name>`, which is what `dbt retry` reads.
+    fn write_run_results(
+        &mut self,
+        compilation: &DbtProjectCompilation,
+        stats: &dbt_schemas::stats::Stats,
+        adapter_responses: &HashMap<String, AdapterResponse>,
+        mut check_result_rows: Vec<dbt_schemas::schemas::RunResultOutput>,
+        nodes: &Nodes,
+    ) {
+        let project_state = compilation.dbt_state();
+        let mut run_results_artifact = build_run_results_artifact(
+            stats,
+            nodes,
+            adapter_responses,
+            self.arg.as_ref(),
+            project_state.warn_error,
+            &project_state.warn_error_options,
+        );
+        run_results_artifact.results.append(&mut check_result_rows);
+
+        if self.arg.write_json && self.arg.command != FsCommand::Parse {
+            write_run_results_json_or_warn(&run_results_artifact, self.arg.as_ref());
+        }
+
+        report_selection_override_reconciliation(self.arg.as_ref(), &run_results_artifact, nodes);
+
+        // Save artifact for callers
+        self.captured_artifacts.run_results = Some(run_results_artifact);
+
+        if self.arg.write_metadata {
+            write_runtime_results_parquet(stats, nodes, adapter_responses, self.arg.as_ref());
+        }
+    }
+
     /// Run tasks based on the arguments.
     /// This can be called multiple times on the same compilation.
     async fn run_tasks(
@@ -984,7 +1048,7 @@ impl<'a> AllPhasesExecutor<'a> {
         compilation_cache_changes: Option<&DbtProjectCompilationCacheChanges>,
         schedule: Schedule<String>,
         token: &CancellationToken,
-    ) -> FsResult<DbtRunTasksResult> {
+    ) -> Result<DbtRunTasksResult, RunTasksError> {
         compilation
             .run_tasks(
                 self.arg.as_ref(),
@@ -1264,6 +1328,10 @@ impl<'a> AllPhasesExecutor<'a> {
             let info = show_args.info.clone();
             let inline = show_args.inline.clone();
             let metadata_dir = self.arg.metadata_dir();
+            let tables = crate::metadata::resolved_injected_tables_without_project(
+                &self.feature_stack,
+                self.arg.as_ref(),
+            );
             let format = self.arg.format;
             let limit = self.arg.limit;
             let token = token.clone();
@@ -1275,6 +1343,7 @@ impl<'a> AllPhasesExecutor<'a> {
                     info.as_deref(),
                     inline.as_deref(),
                     &metadata_dir,
+                    &tables,
                     format,
                     limit,
                     token,
@@ -1315,6 +1384,20 @@ impl<'a> AllPhasesExecutor<'a> {
             arg.write_index = true;
             arg.write_index_implied = true;
         }
+        // Same for the information schema default, but only for a retry: other callers that
+        // reach here with a synthesized command, such as the LSP, do not take it.
+        if self.arg.command_entrypoint == FsCommand::Retry
+            && dbt_clap_core::info_schema_is_default_for(self.arg.command)
+            && !self.arg.generate_info_schema
+            && self.cli.common_args.defaults_info_schema()
+        {
+            let arg = self.arg.to_mut();
+            arg.write_metadata = true;
+            arg.generate_info_schema = true;
+            arg.generate_info_schema_implied = true;
+        }
+        // The invocation record is written from these, not from the flags the run started with.
+        self.captured_artifacts.metadata_flags = Some(metadata_flags(&self.arg));
 
         let (mut compilation, jinja_env, compilation_cache_changes) =
             self.load_and_resolve_state(token).await?;
@@ -1332,16 +1415,19 @@ impl<'a> AllPhasesExecutor<'a> {
         // `--warn-error` it would fail the export. The export prints its own lineage hint,
         // which names the command that would produce it.
         //
-        // Nor when the index came from a command default (`write_index_implied`), for exactly
-        // the same reason: a plain `dbt build` never mentioned the index, so telling it which
-        // flags would enrich one is noise on every invocation, and fails under `--warn-error`.
-        let advise_index_flags = self.arg.write_metadata
-            && matches!(
-                self.arg.command,
-                FsCommand::Compile | FsCommand::Build | FsCommand::Run
-            )
-            && self.arg.command_entrypoint != FsCommand::Docs
-            && !self.arg.write_index_implied;
+        // Nor when the index or information schema came from a command default, for exactly
+        // the same reason: a plain `dbt build` never mentioned them, so telling it which
+        // flags would enrich them is noise on every invocation, and fails under `--warn-error`.
+        let explicit_index = self.arg.write_index && !self.arg.write_index_implied;
+        let explicit_info_schema =
+            self.arg.generate_info_schema && !self.arg.generate_info_schema_implied;
+        let advise_index_flags =
+            (explicit_index || explicit_info_schema || self.cli.common_args.write_metadata)
+                && matches!(
+                    self.arg.command,
+                    FsCommand::Compile | FsCommand::Build | FsCommand::Run
+                )
+                && self.arg.command_entrypoint != FsCommand::Docs;
         let strict_static_analysis = self
             .arg
             .static_analysis
@@ -1349,7 +1435,7 @@ impl<'a> AllPhasesExecutor<'a> {
         // Name the public flag when the user passed one, so the advice is actionable.
         // `--write-index` / `--write-metadata` are hidden; still name them if that is
         // what the invocation actually set.
-        let advised_flag = if self.arg.generate_info_schema {
+        let advised_flag = if explicit_info_schema {
             "--generate-info-schema"
         } else if self.arg.write_index {
             "--write-index"
@@ -1828,7 +1914,22 @@ impl<'a> AllPhasesExecutor<'a> {
         let (run_task_args, run_task_results, jinja_env, adapter, compilation_cache_state) =
             match run_tasks_result {
                 Ok(result) => result,
-                Err(err) => {
+                Err(run_error) => {
+                    // A cancelled run keeps the results it has. Any other failure reports every
+                    // selected node as an error below.
+                    let (err, has_results) = match run_error {
+                        RunTasksError::Cancelled(cancelled) => {
+                            self.write_run_results(
+                                &compilation,
+                                &cancelled.stats,
+                                &cancelled.adapter_responses,
+                                check_result_rows,
+                                &cancelled.resolved_state.nodes,
+                            );
+                            (CancelledError.into(), true)
+                        }
+                        RunTasksError::Failed(err) => (err, false),
+                    };
                     // The manifest represents the parsed project state and is always valid after
                     // load/resolve completes. Writing it unconditionally ensures downstream
                     // systems (codex ingestion, job.run.completed webhooks) can process failed
@@ -1840,7 +1941,7 @@ impl<'a> AllPhasesExecutor<'a> {
                         // Only write for real errors (no exit_status); normal phase-checkpoint
                         // exits (list, format, lint, schedule, source freshness) carry an
                         // exit_status and must not produce spurious "Compilation Error" results.
-                        if err.exit_status().is_none() {
+                        if !has_results && err.exit_status().is_none() {
                             let now = SystemTime::now();
                             let error_stats = dbt_schemas::stats::Stats {
                                 stats: schedule
@@ -1916,49 +2017,16 @@ impl<'a> AllPhasesExecutor<'a> {
 
         let resolved_state = Arc::clone(&run_task_results.resolved_state);
 
-        // Prepare artifact
-        let project_state = compilation.dbt_state();
-        let run_results_artifact = build_run_results_artifact(
+        self.write_run_results(
+            &compilation,
             &run_task_results.stats.run,
-            &resolved_state.nodes,
             &run_task_results.adapter_responses,
-            self.arg.as_ref(),
-            project_state.warn_error,
-            &project_state.warn_error_options,
-        );
-
-        // Write run_results.json eagerly from real stats so that it persists
-        // even if post-execution steps (did_run_tasks, update_manifest,
-        // save_build_cache, did_compile, etc.) fail before the late write_json() call.
-        //
-        // Checks are not tasks, so their verdicts are not in `stats.run` — merge the rows the gate
-        // produced, keyed `check.<project>.<name>`, which is what `dbt retry` reads.
-        let mut run_results_artifact = run_results_artifact;
-        run_results_artifact.results.append(&mut check_result_rows);
-
-        if self.arg.write_json && self.arg.command != FsCommand::Parse {
-            write_run_results_json_or_warn(&run_results_artifact, self.arg.as_ref());
-        }
-
-        report_selection_override_reconciliation(
-            self.arg.as_ref(),
-            &run_results_artifact,
+            check_result_rows,
             &resolved_state.nodes,
         );
 
-        // Save artifact for callers
-        self.captured_artifacts.run_results = Some(run_results_artifact);
         if let Some(Ok(preview)) = &run_task_results.preview {
             self.captured_artifacts.preview = Some(preview.clone());
-        }
-
-        if self.arg.write_metadata {
-            write_runtime_results_parquet(
-                &run_task_results.stats.run,
-                &resolved_state.nodes,
-                &run_task_results.adapter_responses,
-                self.arg.as_ref(),
-            );
         }
 
         for s in &run_task_results.storeables {
@@ -2074,6 +2142,10 @@ impl<'a> AllPhasesExecutor<'a> {
             None
         };
 
+        let injected_tables = crate::metadata::resolved_injected_tables(
+            &self.feature_stack,
+            &project_flag_lookup(compilation.root_project().flags.as_ref()),
+        );
         if self.arg.write_metadata && self.arg.command != FsCommand::Show {
             // `compile --write-catalog` fetched its catalog before compiling, for
             // `catalog.json`. Reuse it so the epochs get the warehouse types too (#16514).
@@ -2092,10 +2164,18 @@ impl<'a> AllPhasesExecutor<'a> {
                 &run_task_results,
                 catalog_data.as_ref(),
                 self.feature_stack.index.hooks.as_ref(),
+                &injected_tables,
             )
             .await?;
 
             self.captured_artifacts.catalog = catalog_data;
+        }
+        // A task of this command may have added rows to a table that the build adds to the
+        // information schema. When the command did not write the information schema, the
+        // one that exists still gets those tables anew.
+        let wrote_info_schema = self.arg.write_metadata && self.arg.generate_info_schema;
+        if !wrote_info_schema && self.arg.command != FsCommand::Show {
+            crate::metadata::refresh_injected_tables(self.arg.as_ref(), &injected_tables);
         }
 
         let map_compiled_sql = self
@@ -2316,7 +2396,12 @@ async fn run_docs_generate(
     // so an artifact set built during the compile would miss it and the site's
     // timings and status surfaces would come up empty — the same reason the ingest
     // above runs twice. Under `--no-compile` this is the only thing that advances it.
-    build_info_schema_for_docs(&metadata_dir, &index_dir, &info_schema_root);
+    build_info_schema_for_docs(
+        &metadata_dir,
+        &index_dir,
+        &info_schema_root,
+        &crate::metadata::resolved_injected_tables_without_project(&feature_stack, eval_arg),
+    );
 
     // Nothing to export. Under `--no-compile` that is the expected way to get here;
     // otherwise the compile above ran but wrote nothing. Checked before opening the
@@ -2431,6 +2516,7 @@ fn build_info_schema_for_docs(
     metadata_dir: &std::path::Path,
     index_dir: &std::path::Path,
     info_schema_root: &std::path::Path,
+    tables: &[ResolvedInjectedTable<'_>],
 ) {
     if !metadata_dir.exists() {
         return;
@@ -2440,7 +2526,9 @@ fn build_info_schema_for_docs(
     } else {
         info_schema_root.with_file_name(dbt_common::constants::DBT_INFO_SCHEMA_STAGING_DIR_NAME)
     };
-    if let Err(err) = write_info_schema(metadata_dir, info_schema_root, &staging) {
+    if let Err(err) =
+        write_info_schema_with_injected(metadata_dir, info_schema_root, &staging, tables)
+    {
         emit_warn_log_message(
             ErrorCode::InfoSchemaWriteFailed,
             format!("dbt docs: could not build the information schema: {err}"),
@@ -2568,10 +2656,10 @@ async fn build_index_for_docs(
 async fn run_docs_serve(
     serve_args: ClapDocsServeArgs,
     feature_stack: &Arc<FeatureStack>,
-    project_dir: &std::path::Path,
+    eval_arg: &EvalArgs,
     common_args: &dbt_clap_core::CommonArgs,
 ) -> FsResult<()> {
-    let has_dbt_state = common_args.get_manage_state(project_dir, false);
+    let has_dbt_state = common_args.get_manage_state(&eval_arg.io.in_dir, false);
     let send_anonymous_usage_stats = common_args.get_send_anonymous_usage_stats();
     let args = dbt_docs_server::DocsServeArgs {
         target_path: serve_args.target_path,
@@ -2611,7 +2699,12 @@ async fn run_docs_serve(
     // metadata epochs into the index and rebuild the information schema from them,
     // so a run since the last `docs generate` is picked up without one.
     ingest_metadata_into_index(&metadata_dir, &index_dir, "dbt docs serve");
-    build_info_schema_for_docs(&metadata_dir, &index_dir, &info_schema_root);
+    build_info_schema_for_docs(
+        &metadata_dir,
+        &index_dir,
+        &info_schema_root,
+        &crate::metadata::resolved_injected_tables_without_project(feature_stack, eval_arg),
+    );
 
     let backend: Arc<dyn Backend> =
         Arc::new(match DuckDbInfoSchemaBackend::open(&info_schema_dir) {

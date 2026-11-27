@@ -12,7 +12,7 @@
 //! Stable service DTO construction lives in `dbt-state::request_builder`.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -37,7 +37,7 @@ use dbt_adbc::QueryCtx;
 use dbt_common::adapter::dialect_of;
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::io_args::RunCacheMode;
-use dbt_common::sources_extractor::SourcesExtractor;
+use dbt_common::sources_extractor::{ExtractedUpstreams, SourcesExtractor};
 use dbt_common::stats::NodeStatus;
 use dbt_common::tracing::dbt_emit::{
     emit_debug_log_message, emit_trace_log_message, emit_warn_log_message,
@@ -60,6 +60,7 @@ use dbt_schemas::schemas::{
     DbtModel, DbtSeed, DbtSnapshot, DbtSource, DbtTest, FreshnessNodeRef, InternalDbtNode,
     InternalDbtNodeAttributes,
 };
+use dbt_state::column_aware::apply_dependency_kinds;
 use dbt_state::explain::{
     StateExplainExecutionConfirmed, StateExplainLogRecord, StateExplainNode, StateExplainNodeInfo,
     append_state_explain_log_record,
@@ -72,7 +73,8 @@ use dbt_state::proto::query_cache::{
     ClientTelemetryEvent, ConfirmExecutionRequest, ExplainedDecision, NodeFuncMapping,
     QueryDependency, RecordExecutionsRequest, SkipExecutionResponse, Struct,
     SubmitEnrichedSqlRequest, SubmitSqlResponse, SubmitValuesRequest, TableModifiedInfo, Value,
-    submit_sql_response, submit_sql_speculative_response, value::Kind,
+    submit_sql_response, submit_sql_speculative_response, table_modified_info::DependencyKind,
+    value::Kind,
 };
 use dbt_state::request_builder::{
     ExecutionOutcomeInput, SessionEndResult, enriched_sql_prepared_event, session_end_event,
@@ -80,8 +82,12 @@ use dbt_state::request_builder::{
     values_execution_record_from_submit_request,
 };
 use dbt_state::service_client::RunCacheServiceError;
+use dbt_state::stage::{StageDependency, stage_dependencies};
 use dbt_telemetry::{ExecutionPhase, NodeEvaluated, NodeType};
 
+use crate::run_cache::column_aware::{
+    ColumnAwareFields, collect_column_aware_fields, dependency_kinds_by_fqn,
+};
 use crate::run_cache::run_cache_request::{
     DbtProjectInfo, SeedRunCacheRequestContext, SqlRunCacheRequestContext, build_model_sql_request,
     build_seed_values_request, build_snapshot_sql_request, build_test_sql_request,
@@ -746,14 +752,21 @@ async fn check_redshift_case_sensitivity(ctx: &TaskRunnerCtx) -> bool {
 /// Collect every relation and source freshness override needed for the run's
 /// metadata prefetch.
 ///
-/// Returns a map of `semantic_fqn → relation` covering every selected node's
-/// own target relation plus the relations of all their runtime dependencies
-/// (models, snapshots, seeds, sources). Ephemeral and inline models are skipped
-/// because they never submit to the service, as are graph-only nodes with no
-/// warehouse relation (see `has_non_empty_schema`). A second map carries
-/// `FreshnessOverride` entries for sources that declare `loaded_at_query` or
-/// `loaded_at_field`; these are passed through to `freshness_with_overrides`
-/// so the prefetch uses the same freshness strategy as per-node submits.
+/// Returns a map of `semantic_fqn → relation` covering:
+/// - the own target relation of every selected model, snapshot and seed. Other
+///   node types (e.g. data tests, whose audit table only exists with
+///   `store_failures`) are skipped, as are ephemeral and inline models
+/// - the relations of every selected node's runtime dependencies (models,
+///   snapshots, seeds, sources), resolved transitively through ephemeral and
+///   inline models, which have no relation of their own
+/// - for unselected dependencies that static analysis deferred, the deferred
+///   relation in addition to the local one
+///
+/// Graph-only nodes with no warehouse relation are skipped (see
+/// `has_metadata_address`). A second map carries `FreshnessOverride` entries
+/// for sources that declare `loaded_at_query` or `loaded_at_field`; these are
+/// passed through to `freshness_with_overrides` so the prefetch uses the same
+/// freshness strategy as per-node submits.
 ///
 /// Taking the individual components rather than a `&TaskRunnerCtx` keeps this
 /// function unit-testable without a live adapter.
@@ -762,57 +775,88 @@ fn collect_global_prefetch_relations(
     runnable_set: &BTreeSet<String>,
     runtime_deps: &BTreeMap<String, BTreeSet<String>>,
     nodes: &dbt_schemas::schemas::Nodes,
+    defer_nodes: Option<&dbt_schemas::schemas::Nodes>,
+    deferred_fqns: &BTreeSet<String>,
 ) -> (
     BTreeMap<String, Arc<dyn BaseRelation>>,
     BTreeMap<String, FreshnessOverride>,
 ) {
     let mut relations: BTreeMap<String, Arc<dyn BaseRelation>> = BTreeMap::new();
     let mut overrides: BTreeMap<String, FreshnessOverride> = BTreeMap::new();
+    let mut add = |node: &dyn InternalDbtNodeAttributes| -> Option<String> {
+        let relation = create_relation_from_node(adapter_type, node, None).ok()?;
+        if !has_metadata_address(adapter_type, relation.as_ref()) {
+            return None;
+        }
+        let fqn = relation.semantic_fqn();
+        relations
+            .entry(fqn.clone())
+            .or_insert_with(|| relation.into());
+        Some(fqn)
+    };
 
     for node_id in runnable_set {
         let Some(node) = nodes.get_node(node_id) else {
             continue;
         };
-        if let Some(model) = node.as_any().downcast_ref::<DbtModel>() {
-            if is_no_op_model_materialization(model.materialized()) {
+        let node_any = node.as_any();
+
+        let should_prefetch_target = match node_any.downcast_ref::<DbtModel>() {
+            Some(model) => !is_no_op_model_materialization(model.materialized()),
+            None => node_any.is::<DbtSnapshot>() || node_any.is::<DbtSeed>(),
+        };
+        if should_prefetch_target {
+            add(node);
+        }
+
+        let mut stack: Vec<&str> = runtime_deps
+            .get(node_id)
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        let mut visited: HashSet<&str> = HashSet::new();
+        while let Some(dep_id) = stack.pop() {
+            if !visited.insert(dep_id) {
                 continue;
             }
-        }
-
-        if let Ok(relation) = create_relation_from_node(adapter_type, node, None)
-            && has_metadata_address(adapter_type, relation.as_ref())
-        {
-            let fqn = relation.semantic_fqn();
-            relations.entry(fqn).or_insert_with(|| relation.into());
-        }
-
-        let Some(dep_ids) = runtime_deps.get(node_id) else {
-            continue;
-        };
-        for dep_id in dep_ids {
             let Some(dep_node) = nodes.get_node(dep_id) else {
                 continue;
             };
-            if !dep_node.as_any().is::<DbtModel>()
-                && !dep_node.as_any().is::<DbtSnapshot>()
-                && !dep_node.as_any().is::<DbtSeed>()
-                && !dep_id.starts_with("source.")
+            let dep_any = dep_node.as_any();
+            if let Some(model) = dep_any.downcast_ref::<DbtModel>()
+                && is_no_op_model_materialization(model.materialized())
+            {
+                stack.extend(
+                    model
+                        .__base_attr__
+                        .depends_on
+                        .nodes
+                        .iter()
+                        .map(String::as_str),
+                );
+                continue;
+            }
+            if !dep_any.is::<DbtModel>()
+                && !dep_any.is::<DbtSnapshot>()
+                && !dep_any.is::<DbtSeed>()
+                && !dep_any.is::<DbtSource>()
             {
                 continue;
             }
-            let Ok(relation) = create_relation_from_node(adapter_type, dep_node, None) else {
-                continue;
-            };
-            if !has_metadata_address(adapter_type, relation.as_ref()) {
-                continue;
-            }
-            let fqn = relation.semantic_fqn();
-            if let Some(source) = dep_node.as_any().downcast_ref::<DbtSource>()
+            if let Some(fqn) = add(dep_node)
+                && let Some(source) = dep_any.downcast_ref::<DbtSource>()
                 && let Some(kind) = source_freshness_override(source)
             {
-                overrides.insert(fqn.clone(), kind);
+                overrides.insert(fqn, kind);
             }
-            relations.entry(fqn).or_insert_with(|| relation.into());
+            if !runnable_set.contains(dep_id)
+                && let Some(deferred_node) = defer_nodes.and_then(|d| d.get_node(dep_id))
+                && let Ok(relation) = create_relation_from_node(adapter_type, deferred_node, None)
+                && deferred_fqns.contains(&relation.semantic_fqn())
+            {
+                add(deferred_node);
+            }
         }
     }
 
@@ -882,6 +926,8 @@ async fn prefetch_global_last_modified_epochs(ctx: &TaskRunnerCtx) -> FsResult<(
         &ctx.inner.runnable_set,
         &ctx.inner.runtime_deps,
         ctx.nodes(),
+        ctx.defer_nodes(),
+        &ctx.inner.run_cache_ctx.run_cache_deferred_fqns,
     );
     if relations.is_empty() {
         return Ok(());
@@ -1151,6 +1197,9 @@ pub async fn run_cache_service_before_run(
         prefetch_ctx.inner.run_cache_ctx.prefetch.mark_done();
     });
     prefetch.set_handle(handle).await;
+
+    // Column-aware reuse: start the schema prefetch. A no-op unless a node needs it.
+    super::column_aware::start_prefetch_schemas(ctx).await;
 
     if let Some(clock) = HeuristicClock::bootstrap(ctx).await {
         let _ = ctx.inner.run_cache_ctx.heuristic_clock.set(clock);
@@ -2541,6 +2590,29 @@ async fn verify_clone_source_freshness(
     }
 }
 
+/// Whether the clone source no longer exists (e.g. dropped outside dbt while the
+/// state DB still lists it as latest). Any lookup failure counts as "not missing".
+pub async fn clone_source_is_missing(
+    ctx: &TaskRunnerCtx,
+    node: &dyn InternalDbtNodeAttributes,
+    clone: &RunCacheCloneDecision,
+) -> bool {
+    if clone.clone_source.is_empty() {
+        return false;
+    }
+    let Ok(source_relation) = relation_from_rendered_name(node, &clone.clone_source) else {
+        return false;
+    };
+    ctx.inner
+        .run_cache_ctx
+        .run_cache_metadata
+        .remove_last_modified_epoch(&clone.clone_source);
+    matches!(
+        refresh_last_modified_epoch_for_relation(ctx, &clone.clone_source, source_relation).await,
+        Ok(None)
+    )
+}
+
 fn relation_from_rendered_name(
     node: &dyn InternalDbtNodeAttributes,
     rendered_name: &str,
@@ -2814,7 +2886,7 @@ async fn submit_model(
         return Ok(None);
     }
 
-    if full_refresh && full_refresh_blocks_model_submit(model.materialized()) {
+    if model_takes_full_refresh_bail(ctx.inner.arg.full_refresh, model) {
         // `--full-refresh` is an explicit instruction to rebuild, so this node
         // must never be skipped. The service cannot enforce that for us: the
         // request carries no full-refresh flag, only `execution_type=FULL`, so
@@ -3142,7 +3214,11 @@ async fn build_sql_request(
         sql.to_string(),
         is_view,
         full_refresh,
-        speculative,
+        if speculative {
+            SqlContextPurpose::Speculative
+        } else {
+            SqlContextPurpose::Decision
+        },
     )
     .await?;
     if !context.metadata_complete {
@@ -3199,7 +3275,7 @@ async fn prepare_write_only_execution_record(
             task_result.sql_instruction.sql.clone(),
             model_is_view(model, &ctx.inner.materialization_resolver),
             full_refresh,
-            false,
+            SqlContextPurpose::ExecutionRecord,
         )
         .await?;
         if !context.metadata_complete {
@@ -3226,7 +3302,7 @@ async fn prepare_write_only_execution_record(
                 ctx.inner.arg.full_refresh,
                 snapshot.deprecated_config.full_refresh,
             ),
-            false,
+            SqlContextPurpose::ExecutionRecord,
         )
         .await?;
         if !context.metadata_complete {
@@ -3473,7 +3549,7 @@ async fn build_sql_context(
     sql: String,
     is_view: bool,
     full_refresh: bool,
-    speculative: bool,
+    purpose: SqlContextPurpose,
 ) -> FsResult<BuiltSqlRunCacheContext> {
     let Some(config) = ctx.inner.run_cache_ctx.run_cache_service_config.as_ref() else {
         return Err(fs_err!(
@@ -3483,17 +3559,35 @@ async fn build_sql_context(
     };
 
     let query_dependencies = collect_query_dependencies(ctx, node, &sql, is_view).await?;
-    let tables = collect_table_modified_infos(
+    let mut tables = collect_table_modified_infos(
         ctx,
         node,
         is_view,
         &query_dependencies.seen_tables,
         &query_dependencies.parser_seen_relations,
         &query_dependencies.unresolvable_tables,
-        speculative,
+        &query_dependencies.stages,
+        purpose == SqlContextPurpose::Speculative,
     )
     .await?;
     let metadata_complete = tables.metadata_complete && query_dependencies.metadata_complete;
+    // An incomplete context is never submitted, so don't fetch schemas for it.
+    let column_aware = if metadata_complete {
+        collect_column_aware_fields(
+            ctx,
+            node,
+            is_view,
+            purpose,
+            &query_dependencies.seen_tables,
+            &query_dependencies.parser_seen_relations,
+        )
+        .await
+    } else {
+        ColumnAwareFields::default()
+    };
+    if column_aware.compare_selected_columns {
+        apply_dependency_kinds(&mut tables.tables, dependency_kinds_by_fqn(ctx));
+    }
     let lenient_dependencies = build_lenient_dependencies(
         config.enable_lenient_dependencies,
         &ctx.inner.run_cache_ctx.run_cache_deferred_fqns,
@@ -3550,6 +3644,9 @@ async fn build_sql_context(
             // Populated by the model submit paths for microbatch models; other
             // node types never carry a window.
             microbatch_window: None,
+            compare_selected_columns: column_aware.compare_selected_columns,
+            table_schemas: column_aware.table_schemas,
+            target_exists: column_aware.target_exists,
             dbt_project_info: DbtProjectInfo::from(ctx),
         },
         metadata_complete,
@@ -3869,6 +3966,10 @@ struct CollectedViewQueryDependencies {
     parser_seen_relations: BTreeMap<String, Arc<dyn BaseRelation>>,
     /// A subset of `seen_tables` whose view definition could not be fetched.
     unresolvable_tables: BTreeSet<String>,
+    /// Snowflake named stages the SQL reads, directly or through views, keyed
+    /// by dependency name. Each one is sent as a table, with the last modified
+    /// time of the newest file it reads.
+    stages: BTreeMap<String, StageDependency>,
     metadata_complete: bool,
 }
 
@@ -3878,12 +3979,14 @@ impl CollectedViewQueryDependencies {
         seen_tables: BTreeSet<String>,
         parser_seen_relations: BTreeMap<String, Arc<dyn BaseRelation>>,
         unresolvable_tables: BTreeSet<String>,
+        stages: BTreeMap<String, StageDependency>,
     ) -> Self {
         Self {
             dependencies,
             seen_tables,
             parser_seen_relations,
             unresolvable_tables,
+            stages,
             metadata_complete: true,
         }
     }
@@ -3894,6 +3997,7 @@ impl CollectedViewQueryDependencies {
             seen_tables: BTreeSet::new(),
             parser_seen_relations: BTreeMap::new(),
             unresolvable_tables: BTreeSet::new(),
+            stages: BTreeMap::new(),
             metadata_complete: false,
         }
     }
@@ -3913,6 +4017,7 @@ impl CollectedViewQueryDependencies {
             BTreeSet::new(),
             BTreeMap::new(),
             BTreeSet::new(),
+            BTreeMap::new(),
         )
     }
 }
@@ -3924,13 +4029,19 @@ async fn collect_table_modified_infos(
     leaf_tables: &BTreeSet<String>,
     parser_seen_relations: &BTreeMap<String, Arc<dyn BaseRelation>>,
     unresolvable_tables: &BTreeSet<String>,
+    stages: &BTreeMap<String, StageDependency>,
     speculative: bool,
 ) -> FsResult<CollectedTableModifiedInfos> {
     let mut relations = BTreeMap::new();
     let mut metadata_complete = true;
 
     let (target_name, target_relation) = relation_for_node(node)?;
-    relations.insert(target_name.clone(), target_relation);
+    // Data tests submit with `target_table=None`, so the freshness of their
+    // audit relation is never used, and it usually doesn't exist (no
+    // `store_failures`). Looking it up would cost a warehouse query per test.
+    if !node.as_any().is::<DbtTest>() {
+        relations.insert(target_name.clone(), target_relation);
+    }
 
     let mut freshness_overrides: BTreeMap<String, FreshnessOverride> = BTreeMap::new();
 
@@ -4021,6 +4132,22 @@ async fn collect_table_modified_infos(
             table_infos.push(TableModifiedInfo {
                 name,
                 last_modified_epoch,
+                kind: DependencyKind::Unknown as i32,
+            });
+        }
+    }
+
+    // A stage without a last modified time (no files, or `LIST` failed) is
+    // sent without one, which the service treats as modified now.
+    if !target_only {
+        if !speculative {
+            prefetch_stage_last_modified_epochs(ctx, stages).await;
+        }
+        for name in stages.keys() {
+            table_infos.push(TableModifiedInfo {
+                name: name.clone(),
+                last_modified_epoch: last_modified_epoch_for_relation(ctx, name).await?,
+                kind: DependencyKind::Unknown as i32,
             });
         }
     }
@@ -4078,6 +4205,10 @@ async fn last_modified_epoch_for_node(
     last_modified_epoch_for_relation(ctx, &name).await
 }
 
+/// Re-reads a node's target epoch from the warehouse, first dropping all of
+/// the target's cached metadata, including existence and column schema. The
+/// build may have created the table or changed its columns, and the metadata
+/// cache outlives the invocation.
 pub async fn refresh_final_last_modified_epoch_for_node(
     ctx: &TaskRunnerCtx,
     node: &dyn InternalDbtNodeAttributes,
@@ -4086,7 +4217,7 @@ pub async fn refresh_final_last_modified_epoch_for_node(
     ctx.inner
         .run_cache_ctx
         .run_cache_metadata
-        .remove_last_modified_epoch(&name);
+        .invalidate_relation_metadata(&name);
     refresh_last_modified_epoch_for_relation(ctx, &name, relation).await
 }
 
@@ -4095,19 +4226,28 @@ pub fn clear_stale_missing_last_modified_epoch_for_node(
     node: &dyn InternalDbtNodeAttributes,
 ) {
     if let Ok((name, _)) = relation_for_node(node) {
-        // Only clear a known-stale placeholder (`Some(None)`), cached when the
-        // submit-time probe found no target table yet. A real cached epoch
-        // (`Some(Some(_))`) is still valid and may be relied on by sibling nodes
-        // later in this same run.
         let run_cache_metadata = &ctx.inner.run_cache_ctx.run_cache_metadata;
+        // A cached "missing" is stale once the node has built the target, and the
+        // cache outlives the invocation. Drop all of its metadata.
+        if run_cache_metadata.relation_exists(&name) == Some(false) {
+            run_cache_metadata.invalidate_relation_metadata(&name);
+            return;
+        }
+        // Otherwise only clear a known-stale placeholder (`Some(None)`), cached
+        // when the submit-time probe found no target table yet. A real cached
+        // epoch (`Some(Some(_))`) is still valid and may be relied on by sibling
+        // nodes later in this same run.
         if matches!(run_cache_metadata.last_modified_epoch(&name), Some(None)) {
             run_cache_metadata.remove_last_modified_epoch(&name);
         }
+        // The build may have changed the target's columns.
+        run_cache_metadata.remove_table_schema(&name);
     }
 }
 
-/// Evicts a node's cached warehouse metadata (last-modified epoch and existence)
-/// when it rebuilds without the dbt State service observing it.
+/// Evicts a node's cached warehouse metadata (last-modified epoch, existence
+/// and column schema) when it rebuilds without the dbt State service observing
+/// it.
 ///
 /// An untracked rebuild makes the cached value stale; without eviction,
 /// downstream nodes in the same invocation report the relation's pre-build
@@ -4139,14 +4279,15 @@ fn stamp_final_last_modified_epoch_for_node_heuristic(
     let epoch = clock.now_ms();
     // Mirror the plugin's `clear_cache` + `cache_last_modified_epoch(table, H)`:
     // replace the stale prefetch value (often None for newly-created tables) with H
-    // so downstream submissions in the same run have metadata_complete=true.
+    // so downstream submissions in the same run have metadata_complete=true. The
+    // clear also drops cached existence and the column schema.
     let Ok((name, _)) = relation_for_node(node) else {
         return None;
     };
     ctx.inner
         .run_cache_ctx
         .run_cache_metadata
-        .remove_last_modified_epoch(&name);
+        .invalidate_relation_metadata(&name);
     ctx.inner
         .run_cache_ctx
         .run_cache_metadata
@@ -4377,6 +4518,64 @@ async fn refresh_last_modified_epoch_for_relation(
         cache.remove_last_modified_epoch_error(&lookup_name);
     }
     result
+}
+
+/// Caches the last modified time of each stage not cached yet: that of the
+/// newest file its `LIST` returns, or `None` when there is no file or `LIST`
+/// fails. Like a table's, it is cached for the run, so a stage read by many
+/// models is listed once.
+async fn prefetch_stage_last_modified_epochs(
+    ctx: &TaskRunnerCtx,
+    stages: &BTreeMap<String, StageDependency>,
+) {
+    let cache = &ctx.inner.run_cache_ctx.run_cache_metadata;
+    let misses = stages
+        .values()
+        .filter(|stage| cache.last_modified_epoch(&stage.name).is_none())
+        .collect::<Vec<_>>();
+    if misses.is_empty() {
+        return;
+    }
+    let Some(adapter) = ctx.env.get_adapter_ref() else {
+        return;
+    };
+    let Some(metadata_adapter) = adapter.metadata_adapter() else {
+        return;
+    };
+    let token = adapter.cancellation_token();
+    let metadata_adapter = metadata_adapter.as_ref();
+    let lookups = misses.into_iter().map(|stage| {
+        let listing = [stage.listing()];
+        let token = token.clone();
+        async move {
+            let listing = &listing;
+            let result = cache
+                .get_or_try_insert_last_modified_epoch(&stage.name, || {
+                    let token = token.clone();
+                    async move {
+                        metadata_adapter
+                            .stage_last_modified(listing, token)
+                            .await
+                            .map(|epochs| epochs.get(&listing[0].name).copied().flatten())
+                            .map_err(into_fs_error)
+                    }
+                })
+                .await;
+            if let Err(err) = result {
+                if token.is_cancelled() {
+                    // Not a real lookup failure; don't leave it cached
+                    cache.remove_last_modified_epoch_error(&stage.name);
+                }
+                emit_trace_log_message(|| {
+                    format!(
+                        "dbt State stage last modified lookup failed for {}: {err}",
+                        stage.name
+                    )
+                });
+            }
+        }
+    });
+    futures::future::join_all(lookups).await;
 }
 
 async fn prefetch_last_modified_epochs(
@@ -4873,7 +5072,7 @@ async fn table_type_for_node(node: &dyn InternalDbtNodeAttributes) -> FsResult<O
     Ok(config_derived_table_type(node, node.node_adapter()))
 }
 
-fn relation_for_node(
+pub(crate) fn relation_for_node(
     node: &dyn InternalDbtNodeAttributes,
 ) -> FsResult<(String, Arc<dyn BaseRelation>)> {
     let relation = create_relation_from_node(node.node_adapter(), node, None)?;
@@ -4896,6 +5095,7 @@ async fn collect_query_dependencies(
     let ParsedSqlRelations {
         relations,
         unsupported_references,
+        stages,
     } = match parse_sql_relations_for_run_cache(
         ctx,
         sql,
@@ -4918,11 +5118,18 @@ async fn collect_query_dependencies(
         // back to the manifest's depends_on graph. Built-ins are exempt:
         // their compiled SQL is always a real query, so an empty result is
         // trustworthy.
-        if node_uses_custom_materialization(node, &ctx.inner.materialization_resolver) {
+        if stages.is_empty()
+            && node_uses_custom_materialization(node, &ctx.inner.materialization_resolver)
+        {
             let manifest_relations = cacheable_manifest_dependency_relations(ctx, node);
             if !manifest_relations.is_empty() {
-                return collect_query_dependencies_from_relations(ctx, node, manifest_relations)
-                    .await;
+                return collect_query_dependencies_from_relations(
+                    ctx,
+                    node,
+                    manifest_relations,
+                    BTreeMap::new(),
+                )
+                .await;
             }
         }
         return Ok(CollectedViewQueryDependencies::complete(
@@ -4930,16 +5137,20 @@ async fn collect_query_dependencies(
             BTreeSet::new(),
             BTreeMap::new(),
             BTreeSet::new(),
+            stages,
         ));
     }
 
-    collect_query_dependencies_from_relations(ctx, node, relations).await
+    collect_query_dependencies_from_relations(ctx, node, relations, stages).await
 }
 
+/// `stages` are the stages the node's own SQL reads; the stages read by the
+/// views it reads are added to them.
 async fn collect_query_dependencies_from_relations(
     ctx: &TaskRunnerCtx,
     node: &dyn InternalDbtNodeAttributes,
     relations: BTreeMap<String, Arc<dyn BaseRelation>>,
+    mut stages: BTreeMap<String, StageDependency>,
 ) -> FsResult<CollectedViewQueryDependencies> {
     let Some(traverser) = ctx.inner.run_cache_ctx.view_traverser.as_deref() else {
         return Ok(CollectedViewQueryDependencies::incomplete());
@@ -4985,6 +5196,7 @@ async fn collect_query_dependencies_from_relations(
 
     let seen_tables = traversal.seen_tables;
     let unresolvable_tables = traversal.unresolvable_tables;
+    stages.extend(traversal.stages);
     let dependencies = traversal
         .view_definitions
         .into_values()
@@ -5004,6 +5216,7 @@ async fn collect_query_dependencies_from_relations(
         seen_tables,
         parser_seen_relations,
         unresolvable_tables,
+        stages,
     ))
 }
 
@@ -5039,7 +5252,8 @@ async fn query_dependencies_for_parse_error(
     let ParsedSqlRelations {
         relations,
         unsupported_references,
-    } = if upstreams.is_empty() {
+        stages,
+    } = if upstreams.tables.is_empty() && upstreams.table_functions.is_empty() {
         ParsedSqlRelations::default()
     } else {
         let Some(adapter) = ctx.env.get_adapter_ref() else {
@@ -5048,6 +5262,8 @@ async fn query_dependencies_for_parse_error(
         relations_from_upstreams(
             node.node_adapter(),
             upstreams,
+            node.database(),
+            node.schema(),
             adapter.engine().type_ops().as_ref(),
         )?
     };
@@ -5061,9 +5277,17 @@ async fn query_dependencies_for_parse_error(
     if relations.is_empty() {
         // Same fallback as in `collect_query_dependencies`: an empty
         // expression-parse result isn't proof of no upstreams.
-        let manifest_relations = cacheable_manifest_dependency_relations(ctx, node);
-        if !manifest_relations.is_empty() {
-            return collect_query_dependencies_from_relations(ctx, node, manifest_relations).await;
+        if stages.is_empty() {
+            let manifest_relations = cacheable_manifest_dependency_relations(ctx, node);
+            if !manifest_relations.is_empty() {
+                return collect_query_dependencies_from_relations(
+                    ctx,
+                    node,
+                    manifest_relations,
+                    BTreeMap::new(),
+                )
+                .await;
+            }
         }
 
         emit_trace_log_message(|| {
@@ -5076,9 +5300,10 @@ async fn query_dependencies_for_parse_error(
             BTreeSet::new(),
             BTreeMap::new(),
             BTreeSet::new(),
+            stages,
         ));
     }
-    collect_query_dependencies_from_relations(ctx, node, relations).await
+    collect_query_dependencies_from_relations(ctx, node, relations, stages).await
 }
 
 /// Resolves a node's manifest depends_on graph into relations, restricted
@@ -5129,12 +5354,14 @@ fn node_uses_custom_materialization(
         .is_some_and(|model| model_is_custom_materialization(model, materialization_resolver))
 }
 
-/// Relations parsed from SQL, plus table references dbt State cannot check
-/// (such as Snowflake stages).
+/// Relations and Snowflake named stages parsed from SQL, plus references dbt
+/// State cannot check (such as user and table stages and table-valued
+/// functions).
 #[derive(Default)]
 struct ParsedSqlRelations {
     relations: BTreeMap<String, Arc<dyn BaseRelation>>,
     unsupported_references: BTreeSet<String>,
+    stages: BTreeMap<String, StageDependency>,
 }
 
 /// Warns that the node reads unsupported references and returns incomplete
@@ -5152,7 +5379,7 @@ fn unsupported_references_dependencies(
     emit_warn_log_message(
         ErrorCode::StateServiceWarn,
         format!(
-            "Model {unique_id} reads from {refs}, table reference(s) that dbt State does not currently support, so they cannot be checked for updates. To let dbt State check for updates, read them through a view declared as a dbt source with loaded_at_field or loaded_at_query. See https://docs.getdbt.com/reference/resource-configs/freshness?version=2#using-loaded_at_query"
+            "Model {unique_id} reads from {refs}, stage(s) or table-valued function(s) that dbt State does not currently support, so they cannot be checked for updates. To let dbt State check for updates, read them through a view declared as a dbt source with loaded_at_field or loaded_at_query. See https://docs.getdbt.com/reference/resource-configs/freshness?version=2#using-loaded_at_query"
         ),
     );
     record_submit_skipped(node, "unsupported references");
@@ -5215,7 +5442,13 @@ fn parse_sql_relations_for_adapter(
             })?,
     };
 
-    relations_from_upstreams(adapter_type, upstreams, type_ops)
+    relations_from_upstreams(
+        adapter_type,
+        upstreams,
+        default_catalog,
+        default_schema,
+        type_ops,
+    )
 }
 
 fn extract_standalone_expression_upstreams_for_run_cache(
@@ -5225,7 +5458,7 @@ fn extract_standalone_expression_upstreams_for_run_cache(
     default_schema: &str,
     quoted_name_ignore_case: bool,
     sources_extractor: &dyn SourcesExtractor,
-) -> FsResult<Vec<NamedReference<FullyQualifiedName>>> {
+) -> FsResult<ExtractedUpstreams> {
     sources_extractor
         .extract_standalone_expression_upstreams(
             adapter_type,
@@ -5242,16 +5475,28 @@ fn extract_standalone_expression_upstreams_for_run_cache(
         })
 }
 
+/// Unqualified stage names are qualified with `default_catalog` and
+/// `default_schema`, the defaults the request sends, so the stage names match
+/// the ones the dbt State service extracts from the SQL.
 fn relations_from_upstreams(
     adapter_type: AdapterType,
-    upstreams: Vec<NamedReference<FullyQualifiedName>>,
+    upstreams: ExtractedUpstreams,
+    default_catalog: &str,
+    default_schema: &str,
     type_ops: &dyn TypeOps,
 ) -> FsResult<ParsedSqlRelations> {
     let mut relations = BTreeMap::new();
-    let mut unsupported_references = BTreeSet::new();
-    for upstream in upstreams.into_iter() {
+    // Table-valued functions read data State cannot see, like user stages.
+    let mut unsupported_references = upstreams.table_functions.clone();
+    let stages = stage_dependencies(
+        adapter_type,
+        &upstreams,
+        default_catalog,
+        default_schema,
+        &mut unsupported_references,
+    );
+    for upstream in upstreams.tables.into_iter() {
         if dbt_state::view_traversal::is_snowflake_stage_reference(adapter_type, &upstream) {
-            unsupported_references.insert(upstream.table().name().to_string());
             continue;
         }
         let relation = create_relation(
@@ -5272,6 +5517,7 @@ fn relations_from_upstreams(
     Ok(ParsedSqlRelations {
         relations,
         unsupported_references,
+        stages,
     })
 }
 
@@ -5308,7 +5554,7 @@ pub fn run_cache_dialect(ctx: &TaskRunnerCtx) -> String {
     }
 }
 
-fn should_honor_service_skip(ctx: &TaskRunnerCtx) -> bool {
+pub(crate) fn should_honor_service_skip(ctx: &TaskRunnerCtx) -> bool {
     effective_run_cache_service_use_cache(
         &ctx.inner.arg.run_cache_mode,
         ctx.inner.run_cache_ctx.run_cache_service_requested,
@@ -5324,8 +5570,28 @@ fn remove_cache_decision_fields(context: &mut SqlRunCacheRequestContext) {
     context.clone_table_properties = None;
 }
 
-fn effective_full_refresh(cli_full_refresh: bool, config_full_refresh: Option<bool>) -> bool {
+pub(crate) fn effective_full_refresh(
+    cli_full_refresh: bool,
+    config_full_refresh: Option<bool>,
+) -> bool {
     config_full_refresh.unwrap_or(cli_full_refresh)
+}
+
+/// Why a SQL context is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqlContextPurpose {
+    /// A submit asking the service for a decision.
+    Decision,
+    /// A speculative submit, built from cache reads only.
+    Speculative,
+    /// Reports an execution afterwards (`RecordExecutions`); asks for no decision.
+    ExecutionRecord,
+}
+
+/// Whether `model` is rebuilt under full refresh without asking the service.
+pub(crate) fn model_takes_full_refresh_bail(cli_full_refresh: bool, model: &DbtModel) -> bool {
+    effective_full_refresh(cli_full_refresh, model.deprecated_config.full_refresh)
+        && full_refresh_blocks_model_submit(model.materialized())
 }
 
 fn full_refresh_blocks_model_submit(materialization: DbtMaterialization) -> bool {
@@ -5350,7 +5616,7 @@ fn effective_run_cache_service_use_cache(
 
 /// Materializations that are inlined into their consumers and therefore never
 /// get a warehouse relation of their own.
-fn is_no_op_model_materialization(materialization: DbtMaterialization) -> bool {
+pub(crate) fn is_no_op_model_materialization(materialization: DbtMaterialization) -> bool {
     matches!(
         materialization,
         DbtMaterialization::Ephemeral | DbtMaterialization::Inline
@@ -5563,7 +5829,7 @@ fn record_submit_skipped(node: &dyn InternalDbtNodeAttributes, reason: &'static 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use dbt_adapter::metadata::CatalogAndSchema;
     use dbt_adapter::time_machine::{
@@ -5605,6 +5871,7 @@ mod tests {
     };
     use dbt_frontend_common::named_reference::NamedReference;
     use dbt_frontend_common::span::ReclassifySpan;
+    use dbt_frontend_common::stage_ref::StageReference;
     use dbt_jinja_utils::jinja_environment::JinjaEnv;
     use dbt_jinja_utils::listener::DefaultRenderingEventListenerFactory;
     use dbt_jinja_utils::phases::NodeAdapterGlobals;
@@ -5636,6 +5903,118 @@ mod tests {
         model.__common_attr__.unique_id = "model.test.orders".to_string();
         model.__model_attr__.state = Some(state);
         model
+    }
+
+    /// A model in `db.analytics` whose `state:` config sets `compare_selected_columns`
+    /// to `flag`.
+    fn model_comparing_selected_columns(
+        unique_id: &str,
+        materialized: DbtMaterialization,
+        flag: bool,
+    ) -> DbtModel {
+        let mut model = model_with_state(ModelState {
+            lag_tolerance: None,
+            require_fresh_data_from: None,
+            evaluate_volatile_sql: None,
+            pre_clone: None,
+            execute_hooks_on_any_reuse: None,
+            compare_unrendered_code: None,
+            ignore_external_modifications: None,
+            compare_selected_columns: Some(flag),
+        });
+        model.__common_attr__.unique_id = unique_id.to_string();
+        model.__common_attr__.language = Some("sql".to_string());
+        model.__base_attr__.database = "db".to_string();
+        model.__base_attr__.schema = "analytics".to_string();
+        model.__base_attr__.alias = unique_id
+            .rsplit('.')
+            .next()
+            .unwrap_or(unique_id)
+            .to_string();
+        model.__base_attr__.materialized = materialized;
+        model
+    }
+
+    #[dbt_runtime::test]
+    async fn tables_carry_dependency_kinds_when_flag_on() {
+        let cases = [
+            ("model.test.flag_on", DbtMaterialization::Table, true, false),
+            (
+                "model.test.flag_off",
+                DbtMaterialization::Table,
+                false,
+                false,
+            ),
+            (
+                "model.test.view_flag_on",
+                DbtMaterialization::View,
+                true,
+                true,
+            ),
+        ];
+        let mut nodes = Nodes::default();
+        for (unique_id, materialized, flag, _) in &cases {
+            nodes.models.insert(
+                unique_id.to_string(),
+                Arc::new(model_comparing_selected_columns(
+                    unique_id,
+                    materialized.clone(),
+                    *flag,
+                )),
+            );
+        }
+        let ctx = test_task_runner_ctx_with_nodes(
+            None,
+            RunCacheMode::ReadWrite,
+            false,
+            Arc::new(EmptySourcesExtractor),
+            nodes,
+            cases.iter().map(|(id, ..)| id.to_string()).collect(),
+        );
+        let kinds = dependency_kinds_by_fqn(&ctx).clone();
+
+        for (unique_id, _, flag, is_view) in cases {
+            let node = ctx.nodes().get_node(unique_id).expect("node");
+            let (target, _) = relation_for_node(node).expect("relation");
+            ctx.inner
+                .run_cache_ctx
+                .run_cache_metadata
+                .insert_last_modified_epoch(target.clone(), Some(1));
+            for purpose in [
+                SqlContextPurpose::Decision,
+                SqlContextPurpose::ExecutionRecord,
+            ] {
+                let built =
+                    build_sql_context(&ctx, node, "select 1".to_string(), is_view, false, purpose)
+                        .await
+                        .expect("context");
+                let request = built.request;
+                assert_eq!(
+                    request.compare_selected_columns,
+                    flag && !is_view,
+                    "{unique_id}"
+                );
+                assert_eq!(request.tables.len(), 1, "{unique_id}: the target only");
+                for table in &request.tables {
+                    let expected = if flag && !is_view {
+                        kinds
+                            .get(&table.name)
+                            .copied()
+                            .unwrap_or(DependencyKind::Unknown)
+                    } else {
+                        DependencyKind::Unknown
+                    };
+                    assert_eq!(table.kind, expected as i32, "{unique_id}: {}", table.name);
+                }
+                if flag && !is_view {
+                    assert_eq!(
+                        request.tables[0].kind,
+                        DependencyKind::Model as i32,
+                        "the flagged model's own target is a model"
+                    );
+                }
+            }
+        }
     }
 
     /// Seeds resolve with materialized: Table (see resolve_seeds.rs).
@@ -6921,6 +7300,223 @@ mod tests {
         );
     }
 
+    /// Caches "target missing" as a first build's submit-time probe would.
+    fn cache_target_as_missing(ctx: &TaskRunnerCtx, target_fqn: &str) {
+        let cache = &ctx.inner.run_cache_ctx.run_cache_metadata;
+        cache.insert_relation_exists(target_fqn, false);
+        cache.insert_last_modified_epoch(target_fqn, None);
+    }
+
+    /// After the post-execution refresh, the run's relation lookup must not
+    /// still answer "missing" for the target the node just built: the cache
+    /// outlives the invocation, and a stale `Some(false)` would send
+    /// `target_table_missing=true` on a later submit.
+    async fn assert_target_not_cached_missing(
+        ctx: &TaskRunnerCtx,
+        model: &dyn InternalDbtNodeAttributes,
+    ) {
+        let (target_fqn, relation) = relation_for_node(model).expect("relation");
+        assert_eq!(
+            ctx.inner
+                .run_cache_ctx
+                .run_cache_metadata
+                .relation_exists(&target_fqn),
+            None
+        );
+        // With no adapter in the test ctx, a re-query fails open to `None`.
+        assert_ne!(
+            crate::run_cache::run_cache_dev_clone::relation_exists(ctx, &target_fqn, relation)
+                .await,
+            Some(false)
+        );
+    }
+
+    /// Tracked and write-only executions resolve the final epoch through
+    /// `refresh_final_last_modified_epoch_for_node` when there is no heuristic
+    /// clock.
+    #[dbt_runtime::test]
+    async fn refresh_final_epoch_drops_cached_missing_target_existence() {
+        let ctx = test_task_runner_ctx(None);
+        let model = make_model(
+            "model.test.user_name_model",
+            "db",
+            "dbt_test",
+            "user_name_model",
+            DbtMaterialization::Incremental,
+        );
+        cache_target_as_missing(&ctx, &fqn_of("db", "dbt_test", "user_name_model"));
+
+        refresh_final_last_modified_epoch_for_node(&ctx, model.as_ref())
+            .await
+            .unwrap();
+
+        assert_target_not_cached_missing(&ctx, model.as_ref()).await;
+    }
+
+    /// ...and through the heuristic stamp when the clock is set.
+    #[dbt_runtime::test]
+    async fn final_epoch_heuristic_stamp_drops_cached_missing_target_existence() {
+        let ctx = test_task_runner_ctx(None);
+        let model = make_model(
+            "model.test.user_name_model",
+            "db",
+            "dbt_test",
+            "user_name_model",
+            DbtMaterialization::Incremental,
+        );
+        let target_fqn = fqn_of("db", "dbt_test", "user_name_model");
+        cache_target_as_missing(&ctx, &target_fqn);
+        ctx.inner
+            .run_cache_ctx
+            .heuristic_clock
+            .set(HeuristicClock {
+                start_ts_ms: 1_700_000_000_000,
+                start_instant: Instant::now(),
+            })
+            .unwrap();
+
+        let epoch = final_last_modified_epoch_for_node(&ctx, model.as_ref())
+            .await
+            .unwrap();
+
+        assert!(epoch.is_some());
+        assert_eq!(
+            ctx.inner
+                .run_cache_ctx
+                .run_cache_metadata
+                .last_modified_epoch(&target_fqn),
+            Some(epoch)
+        );
+        assert_target_not_cached_missing(&ctx, model.as_ref()).await;
+    }
+
+    /// Executions without a confirmation or record (`RunCacheAfterSuccess::None`)
+    /// go through `clear_stale_missing_last_modified_epoch_for_node`.
+    #[dbt_runtime::test]
+    async fn clear_stale_missing_epoch_drops_cached_missing_target_existence() {
+        let ctx = test_task_runner_ctx(None);
+        let model = make_model(
+            "model.test.user_name_model",
+            "db",
+            "dbt_test",
+            "user_name_model",
+            DbtMaterialization::Incremental,
+        );
+        let target_fqn = fqn_of("db", "dbt_test", "user_name_model");
+        cache_target_as_missing(&ctx, &target_fqn);
+
+        clear_stale_missing_last_modified_epoch_for_node(&ctx, model.as_ref());
+
+        assert_eq!(
+            ctx.inner
+                .run_cache_ctx
+                .run_cache_metadata
+                .last_modified_epoch(&target_fqn),
+            None
+        );
+        assert_target_not_cached_missing(&ctx, model.as_ref()).await;
+    }
+
+    #[test]
+    fn clear_stale_missing_epoch_preserves_cached_existing_target() {
+        let ctx = test_task_runner_ctx(None);
+        let model = make_model(
+            "model.test.user_name_model",
+            "db",
+            "dbt_test",
+            "user_name_model",
+            DbtMaterialization::Table,
+        );
+        let target_fqn = fqn_of("db", "dbt_test", "user_name_model");
+        let cache = &ctx.inner.run_cache_ctx.run_cache_metadata;
+        cache.insert_relation_exists(&target_fqn, true);
+        cache.insert_last_modified_epoch(&target_fqn, Some(1_700_000_000_000));
+
+        clear_stale_missing_last_modified_epoch_for_node(&ctx, model.as_ref());
+
+        assert_eq!(cache.relation_exists(&target_fqn), Some(true));
+        assert_eq!(
+            cache.last_modified_epoch(&target_fqn),
+            Some(Some(1_700_000_000_000))
+        );
+    }
+
+    /// Every post-build path drops the target's cached column schema, so a table
+    /// rebuilt in the run (e.g. a seed under `--full-refresh`) isn't sent stale
+    /// downstream.
+    #[dbt_runtime::test]
+    async fn post_build_paths_drop_cached_target_schema() {
+        use dbt_state::proto::query_cache::ColumnInfo;
+
+        let model = make_model(
+            "model.test.user_name_model",
+            "db",
+            "dbt_test",
+            "user_name_model",
+            DbtMaterialization::Table,
+        );
+        let target_fqn = fqn_of("db", "dbt_test", "user_name_model");
+        let fresh_ctx_with_cached_schema = || {
+            let ctx = test_task_runner_ctx(None);
+            ctx.inner
+                .run_cache_ctx
+                .run_cache_metadata
+                .insert_table_schema(
+                    target_fqn.clone(),
+                    Some(Arc::from(vec![ColumnInfo {
+                        name: "ID".to_string(),
+                        r#type: "NUMBER(38,0)".to_string(),
+                    }])),
+                );
+            assert!(
+                ctx.inner
+                    .run_cache_ctx
+                    .run_cache_metadata
+                    .table_schema(&target_fqn)
+                    .is_some()
+            );
+            ctx
+        };
+        let assert_schema_dropped = |ctx: &TaskRunnerCtx, path: &str| {
+            assert!(
+                ctx.inner
+                    .run_cache_ctx
+                    .run_cache_metadata
+                    .table_schema(&target_fqn)
+                    .is_none(),
+                "{path} left the target's schema cached"
+            );
+        };
+
+        let ctx = fresh_ctx_with_cached_schema();
+        refresh_final_last_modified_epoch_for_node(&ctx, model.as_ref())
+            .await
+            .unwrap();
+        assert_schema_dropped(&ctx, "refresh_final_last_modified_epoch_for_node");
+
+        let ctx = fresh_ctx_with_cached_schema();
+        ctx.inner
+            .run_cache_ctx
+            .heuristic_clock
+            .set(HeuristicClock {
+                start_ts_ms: 1_700_000_000_000,
+                start_instant: Instant::now(),
+            })
+            .unwrap();
+        final_last_modified_epoch_for_node(&ctx, model.as_ref())
+            .await
+            .unwrap();
+        assert_schema_dropped(&ctx, "the heuristic stamp");
+
+        let ctx = fresh_ctx_with_cached_schema();
+        clear_stale_missing_last_modified_epoch_for_node(&ctx, model.as_ref());
+        assert_schema_dropped(&ctx, "clear_stale_missing_last_modified_epoch_for_node");
+
+        let ctx = fresh_ctx_with_cached_schema();
+        evict_node_metadata_for_untracked_rebuild(&ctx, model.as_ref());
+        assert_schema_dropped(&ctx, "evict_node_metadata_for_untracked_rebuild");
+    }
+
     #[test]
     fn evict_node_metadata_for_untracked_rebuild_clears_valid_epoch_and_existence() {
         let ctx = test_task_runner_ctx(None);
@@ -7036,6 +7632,7 @@ mod tests {
             &BTreeSet::from([upstream_fqn.clone()]),
             &BTreeMap::new(),
             &BTreeSet::new(),
+            &BTreeMap::new(),
             false,
         )
         .await
@@ -7045,11 +7642,81 @@ mod tests {
         assert!(tables.tables.contains(&TableModifiedInfo {
             name: target_fqn,
             last_modified_epoch: Some(123),
+            kind: DependencyKind::Unknown as i32,
         }));
         assert!(tables.tables.contains(&TableModifiedInfo {
             name: upstream_fqn,
             last_modified_epoch: None,
+            kind: DependencyKind::Unknown as i32,
         }));
+    }
+
+    #[dbt_runtime::test]
+    async fn data_test_submit_does_not_look_up_its_audit_relation() {
+        let model = make_model(
+            "model.test.orders",
+            "db",
+            "analytics",
+            "orders",
+            DbtMaterialization::Table,
+        );
+        let mut test = DbtTest::default();
+        test.__common_attr__.unique_id = "test.test.not_null_orders_id".to_string();
+        test.__base_attr__.database = "db".to_string();
+        test.__base_attr__.schema = "analytics_dbt_test__audit".to_string();
+        test.__base_attr__.alias = "not_null_orders_id".to_string();
+        test.__base_attr__.materialized = DbtMaterialization::Test;
+        test.__base_attr__.depends_on.nodes = vec!["model.test.orders".to_string()];
+        let test = Arc::new(test);
+        let mut nodes = nodes_from(vec![model], vec![]);
+        nodes
+            .tests
+            .insert("test.test.not_null_orders_id".to_string(), test.clone());
+        let ctx = test_task_runner_ctx_with_nodes(
+            None,
+            RunCacheMode::ReadWrite,
+            false,
+            Arc::new(EmptySourcesExtractor),
+            nodes,
+            BTreeSet::from(["test.test.not_null_orders_id".to_string()]),
+        );
+        let audit_fqn = fqn_of("db", "analytics_dbt_test__audit", "not_null_orders_id");
+        let upstream_fqn = fqn_of("db", "analytics", "orders");
+        // The global prefetch resolved the upstream but not the audit relation.
+        ctx.inner
+            .run_cache_ctx
+            .run_cache_metadata
+            .insert_last_modified_epoch(&upstream_fqn, Some(123));
+
+        let tables = collect_table_modified_infos(
+            &ctx,
+            test.as_ref(),
+            false,
+            &BTreeSet::from([upstream_fqn.clone()]),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            tables.tables,
+            vec![TableModifiedInfo {
+                name: upstream_fqn,
+                last_modified_epoch: Some(123),
+                kind: DependencyKind::Unknown as i32,
+            }]
+        );
+        assert_eq!(
+            ctx.inner
+                .run_cache_ctx
+                .run_cache_metadata
+                .last_modified_epoch(&audit_fqn),
+            None,
+            "the audit relation must not be looked up"
+        );
     }
 
     // ── speculative submit tests ─────────────────────────────────────────────
@@ -7099,6 +7766,7 @@ mod tests {
             &BTreeSet::from([upstream_fqn.clone()]),
             &BTreeMap::new(),
             &BTreeSet::new(),
+            &BTreeMap::new(),
             true,
         )
         .await
@@ -7108,6 +7776,7 @@ mod tests {
         assert!(tables.tables.contains(&TableModifiedInfo {
             name: upstream_fqn.clone(),
             last_modified_epoch: None,
+            kind: DependencyKind::Unknown as i32,
         }));
         // A speculative build issues no blocking per-node freshness query, so an
         // unresolved upstream stays a genuine cache miss (never inserted).
@@ -7131,6 +7800,7 @@ mod tests {
             &BTreeSet::from([upstream_fqn.clone()]),
             &BTreeMap::new(),
             &BTreeSet::new(),
+            &BTreeMap::new(),
             false,
         )
         .await
@@ -7140,6 +7810,7 @@ mod tests {
         assert!(tables.tables.contains(&TableModifiedInfo {
             name: upstream_fqn.clone(),
             last_modified_epoch: None,
+            kind: DependencyKind::Unknown as i32,
         }));
         // A non-speculative build resolves the miss with a blocking freshness
         // lookup; with no adapter wired in the test env it records an explicit
@@ -7518,10 +8189,12 @@ mod tests {
                 TableModifiedInfo {
                     name: warm_fqn.clone(),
                     last_modified_epoch: Some(111),
+                    kind: DependencyKind::Unknown as i32,
                 },
                 TableModifiedInfo {
                     name: cold_fqn.clone(),
                     last_modified_epoch: Some(222),
+                    kind: DependencyKind::Unknown as i32,
                 },
             ],
             ..Default::default()
@@ -7536,12 +8209,14 @@ mod tests {
                 TableModifiedInfo {
                     name: warm_fqn.clone(),
                     last_modified_epoch: Some(999),
+                    kind: DependencyKind::Unknown as i32,
                 },
                 // The post-prefetch refresh resolved this as unknown, so the
                 // stale speculative value is cleared to unset rather than kept.
                 TableModifiedInfo {
                     name: cold_fqn.clone(),
                     last_modified_epoch: None,
+                    kind: DependencyKind::Unknown as i32,
                 },
             ],
         );
@@ -7646,6 +8321,7 @@ mod tests {
             execute_hooks_on_any_reuse: Some(true),
             compare_unrendered_code: None,
             ignore_external_modifications: None,
+            compare_selected_columns: None,
         });
 
         assert!(should_execute_hooks_for_skip_reuse(&model, false));
@@ -7661,6 +8337,7 @@ mod tests {
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: None,
             ignore_external_modifications: None,
+            compare_selected_columns: None,
         });
 
         assert!(should_execute_hooks_for_skip_reuse(&model, true));
@@ -7680,6 +8357,7 @@ mod tests {
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: None,
             ignore_external_modifications: None,
+            compare_selected_columns: None,
         });
 
         assert_eq!(freshness_tolerance_seconds_for_node(&model, 2700), 7200);
@@ -7695,6 +8373,7 @@ mod tests {
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: None,
             ignore_external_modifications: None,
+            compare_selected_columns: None,
         });
         model.__model_attr__.freshness = Some(ModelFreshness {
             build_after: Some(ModelFreshnessRules {
@@ -7722,6 +8401,7 @@ mod tests {
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: None,
             ignore_external_modifications: None,
+            compare_selected_columns: None,
         });
         model.__model_attr__.freshness = Some(ModelFreshness {
             build_after: Some(ModelFreshnessRules {
@@ -7755,6 +8435,7 @@ mod tests {
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: None,
             ignore_external_modifications: None,
+            compare_selected_columns: None,
         });
         model.__model_attr__.freshness = Some(ModelFreshness {
             build_after: Some(ModelFreshnessRules {
@@ -7781,6 +8462,7 @@ mod tests {
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: None,
             ignore_external_modifications: None,
+            compare_selected_columns: None,
         });
         model.__common_attr__.meta.insert(
             "run_cache_tolerate_nondeterminism".to_string(),
@@ -7812,6 +8494,7 @@ mod tests {
             execute_hooks_on_any_reuse: Some(true),
             compare_unrendered_code: None,
             ignore_external_modifications: None,
+            compare_selected_columns: None,
         });
 
         assert!(should_execute_hooks_for_skip_reuse(&snapshot, false));
@@ -7832,13 +8515,14 @@ mod tests {
 
     #[test]
     fn data_test_state_config_is_honored_by_run_cache() {
-        // Data tests carry the restricted `DataTestState` (2 keys). The two supported configs are
-        // honored; the 5-key-only configs (e.g. execute_hooks_on_any_reuse) are not modeled and fall
+        // Data tests carry the restricted `DataTestState` (4 keys). The supported configs are
+        // honored; the model-only configs (e.g. execute_hooks_on_any_reuse) are not modeled and fall
         // back to the service default.
         let test = data_test_with_state(DataTestState {
             require_fresh_data_from: Some(UpdatesOn::All),
             evaluate_volatile_sql: Some(true),
             compare_unrendered_code: None,
+            compare_selected_columns: None,
         });
 
         assert!(!resolve_tolerate_nondeterminism(&test, true));
@@ -7860,6 +8544,7 @@ mod tests {
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: None,
             ignore_external_modifications: None,
+            compare_selected_columns: None,
         });
 
         assert!(resolve_compare_unrendered_code(&model, true));
@@ -7879,6 +8564,7 @@ mod tests {
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: Some(true),
             ignore_external_modifications: None,
+            compare_selected_columns: None,
         });
         let disabled = model_with_state(ModelState {
             lag_tolerance: None,
@@ -7888,6 +8574,7 @@ mod tests {
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: Some(false),
             ignore_external_modifications: None,
+            compare_selected_columns: None,
         });
 
         assert!(resolve_compare_unrendered_code(&enabled, false));
@@ -7904,11 +8591,13 @@ mod tests {
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: Some(true),
             ignore_external_modifications: None,
+            compare_selected_columns: None,
         });
         let test = data_test_with_state(DataTestState {
             require_fresh_data_from: None,
             evaluate_volatile_sql: None,
             compare_unrendered_code: Some(true),
+            compare_selected_columns: None,
         });
 
         assert!(resolve_compare_unrendered_code(&snapshot, false));
@@ -7925,6 +8614,7 @@ mod tests {
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: None,
             ignore_external_modifications: Some(true),
+            compare_selected_columns: None,
         });
         view.__base_attr__.materialized = DbtMaterialization::View;
         assert!(resolve_ignore_external_modifications(&view, false));
@@ -7954,6 +8644,7 @@ mod tests {
                 execute_hooks_on_any_reuse: None,
                 compare_unrendered_code: None,
                 ignore_external_modifications: Some(true),
+                compare_selected_columns: None,
             });
             assert!(resolve_ignore_external_modifications(&view, false));
         }
@@ -7966,11 +8657,13 @@ mod tests {
             execute_hooks_on_any_reuse: None,
             compare_unrendered_code: None,
             ignore_external_modifications: Some(true),
+            compare_selected_columns: None,
         });
         let data_test = data_test_with_state(DataTestState {
             require_fresh_data_from: None,
             evaluate_volatile_sql: None,
             compare_unrendered_code: None,
+            compare_selected_columns: None,
         });
         assert!(resolve_ignore_external_modifications(&snapshot, false));
         assert!(!resolve_ignore_external_modifications(&data_test, false));
@@ -7986,6 +8679,7 @@ mod tests {
         let tables = vec![TableModifiedInfo {
             name: "prod.analytics.customers".to_string(),
             last_modified_epoch: Some(123),
+            kind: DependencyKind::Unknown as i32,
         }];
         let query_dependencies = vec![QueryDependency {
             name: "prod.analytics.orders".to_string(),
@@ -8234,7 +8928,7 @@ mod tests {
         }
     }
 
-    struct RecordingRunCacheClient {
+    pub(crate) struct RecordingRunCacheClient {
         submitted: Mutex<Vec<SubmitEnrichedSqlRequest>>,
         speculative_submitted: Mutex<Vec<SubmitEnrichedSqlRequest>>,
         response: SubmitSqlResponse,
@@ -8450,6 +9144,7 @@ mod tests {
             tables: vec![TableModifiedInfo {
                 name: "db.schema.dependency".to_string(),
                 last_modified_epoch: Some(1),
+                kind: DependencyKind::Unknown as i32,
             }],
             ..Default::default()
         };
@@ -8632,7 +9327,7 @@ mod tests {
         }
     }
 
-    struct EmptySourcesExtractor;
+    pub(crate) struct EmptySourcesExtractor;
 
     impl SourcesExtractor for EmptySourcesExtractor {
         fn extract_upstreams(
@@ -8642,8 +9337,8 @@ mod tests {
             _default_catalog: &str,
             _default_schema: &str,
             _quoted_name_ignore_case: bool,
-        ) -> FrontendResult<Vec<NamedReference<FullyQualifiedName>>> {
-            Ok(Vec::new())
+        ) -> FrontendResult<ExtractedUpstreams> {
+            Ok(ExtractedUpstreams::default())
         }
 
         fn extract_standalone_expression_upstreams(
@@ -8653,8 +9348,8 @@ mod tests {
             _default_catalog: &str,
             _default_schema: &str,
             _quoted_name_ignore_case: bool,
-        ) -> FrontendResult<Vec<NamedReference<FullyQualifiedName>>> {
-            Ok(Vec::new())
+        ) -> FrontendResult<ExtractedUpstreams> {
+            Ok(ExtractedUpstreams::default())
         }
     }
 
@@ -8672,7 +9367,7 @@ mod tests {
             _default_catalog: &str,
             _default_schema: &str,
             _quoted_name_ignore_case: bool,
-        ) -> FrontendResult<Vec<NamedReference<FullyQualifiedName>>> {
+        ) -> FrontendResult<ExtractedUpstreams> {
             Err(Box::new(synthetic_frontend_error()))
         }
 
@@ -8683,7 +9378,7 @@ mod tests {
             _default_catalog: &str,
             _default_schema: &str,
             _quoted_name_ignore_case: bool,
-        ) -> FrontendResult<Vec<NamedReference<FullyQualifiedName>>> {
+        ) -> FrontendResult<ExtractedUpstreams> {
             Err(Box::new(synthetic_frontend_error()))
         }
     }
@@ -8698,7 +9393,7 @@ mod tests {
             _default_catalog: &str,
             _default_schema: &str,
             _quoted_name_ignore_case: bool,
-        ) -> FrontendResult<Vec<NamedReference<FullyQualifiedName>>> {
+        ) -> FrontendResult<ExtractedUpstreams> {
             Err(Box::new(synthetic_frontend_error()))
         }
 
@@ -8709,11 +9404,11 @@ mod tests {
             _default_catalog: &str,
             _default_schema: &str,
             _quoted_name_ignore_case: bool,
-        ) -> FrontendResult<Vec<NamedReference<FullyQualifiedName>>> {
+        ) -> FrontendResult<ExtractedUpstreams> {
             if sql == "'alice'" {
-                Ok(Vec::new())
+                Ok(ExtractedUpstreams::default())
             } else if sql == "(select max(id) from raw.users)" {
-                Ok(vec![FullyQualifiedName::new("db", "raw", "users").into()])
+                Ok(vec![FullyQualifiedName::new("db", "raw", "users").into()].into())
             } else {
                 Err(Box::new(synthetic_frontend_error()))
             }
@@ -8740,8 +9435,8 @@ mod tests {
             _default_catalog: &str,
             _default_schema: &str,
             _quoted_name_ignore_case: bool,
-        ) -> FrontendResult<Vec<NamedReference<FullyQualifiedName>>> {
-            Ok(Self::upstreams())
+        ) -> FrontendResult<ExtractedUpstreams> {
+            Ok(Self::upstreams().into())
         }
 
         fn extract_standalone_expression_upstreams(
@@ -8751,8 +9446,8 @@ mod tests {
             _default_catalog: &str,
             _default_schema: &str,
             _quoted_name_ignore_case: bool,
-        ) -> FrontendResult<Vec<NamedReference<FullyQualifiedName>>> {
-            Ok(Self::upstreams())
+        ) -> FrontendResult<ExtractedUpstreams> {
+            Ok(Self::upstreams().into())
         }
     }
 
@@ -8767,8 +9462,8 @@ mod tests {
             _default_catalog: &str,
             _default_schema: &str,
             _quoted_name_ignore_case: bool,
-        ) -> FrontendResult<Vec<NamedReference<FullyQualifiedName>>> {
-            Ok(vec![FullyQualifiedName::new("db", "s", "@S.STG").into()])
+        ) -> FrontendResult<ExtractedUpstreams> {
+            Ok(vec![FullyQualifiedName::new("db", "s", "@S.STG").into()].into())
         }
 
         fn extract_standalone_expression_upstreams(
@@ -8778,7 +9473,7 @@ mod tests {
             catalog: &str,
             schema: &str,
             ignore_case: bool,
-        ) -> FrontendResult<Vec<NamedReference<FullyQualifiedName>>> {
+        ) -> FrontendResult<ExtractedUpstreams> {
             self.extract_upstreams(adapter_type, sql, catalog, schema, ignore_case)
         }
     }
@@ -8891,6 +9586,398 @@ mod tests {
         assert!(!deps.metadata_complete);
     }
 
+    /// Returns a table and a named stage with its details, the stage also as a
+    /// table named by its location, like the SQL frontend does.
+    struct NamedStageSourcesExtractor {
+        with_table: bool,
+    }
+
+    impl NamedStageSourcesExtractor {
+        fn upstreams(&self) -> ExtractedUpstreams {
+            let mut tables = vec![FullyQualifiedName::new("db", "s", "@stg/2024/").into()];
+            if self.with_table {
+                tables.push(FullyQualifiedName::new("db", "s", "t").into());
+            }
+            ExtractedUpstreams {
+                tables,
+                stages: BTreeSet::from([StageReference {
+                    location: "@stg/2024/".to_string(),
+                    pattern: Some(".*csv".to_string()),
+                }]),
+                ..Default::default()
+            }
+        }
+    }
+
+    impl SourcesExtractor for NamedStageSourcesExtractor {
+        fn extract_upstreams(
+            &self,
+            _adapter_type: AdapterType,
+            _sql: &str,
+            _default_catalog: &str,
+            _default_schema: &str,
+            _quoted_name_ignore_case: bool,
+        ) -> FrontendResult<ExtractedUpstreams> {
+            Ok(self.upstreams())
+        }
+
+        fn extract_standalone_expression_upstreams(
+            &self,
+            _adapter_type: AdapterType,
+            _sql: &str,
+            _default_catalog: &str,
+            _default_schema: &str,
+            _quoted_name_ignore_case: bool,
+        ) -> FrontendResult<ExtractedUpstreams> {
+            Ok(self.upstreams())
+        }
+    }
+
+    /// The name the dbt State service gives the stage
+    /// [`NamedStageSourcesExtractor`] returns, read by a model in `db.s`.
+    const NAMED_STAGE: &str = r#"@"DB"."S"."STG"/2024/ (PATTERN => '.*csv')"#;
+
+    #[test]
+    fn parse_sql_relations_for_adapter_tracks_named_stages() {
+        let type_ops = DefaultTypeOps::new(AdapterType::Snowflake);
+        let parsed = parse_sql_relations_for_adapter(
+            AdapterType::Snowflake,
+            "select * from t, @stg/2024/ (pattern => '.*csv')",
+            "db",
+            "s",
+            false,
+            &NamedStageSourcesExtractor { with_table: true },
+            &type_ops,
+        )
+        .expect("stage references should not fail parsing");
+
+        assert_eq!(
+            parsed.relations.keys().cloned().collect::<Vec<_>>(),
+            vec![fqn_of("db", "s", "t")]
+        );
+        assert!(parsed.unsupported_references.is_empty());
+        assert_eq!(
+            parsed.stages.keys().map(String::as_str).collect::<Vec<_>>(),
+            [NAMED_STAGE]
+        );
+        assert_eq!(
+            parsed.stages[NAMED_STAGE].list_sql,
+            r#"LIST @"DB"."S"."STG"/2024/ PATTERN = '.*csv'"#
+        );
+    }
+
+    #[dbt_runtime::test]
+    async fn model_reading_named_stage_directly_tracks_it() {
+        let ctx = test_task_runner_ctx_with_mode_and_sources_extractor(
+            None,
+            RunCacheMode::ReadWrite,
+            false,
+            Arc::new(NamedStageSourcesExtractor { with_table: false }),
+        );
+        let adapter = ctx
+            .adapter_store()
+            .get(AdapterType::Snowflake)
+            .expect("mock adapter");
+        let ctx = ctx_with_adapter_in_env(&ctx, &adapter);
+        let model = make_model(
+            "model.test.reads_stage",
+            "db",
+            "s",
+            "reads_stage",
+            DbtMaterialization::Table,
+        );
+
+        let deps = collect_query_dependencies(&ctx, model.as_ref(), "select 1", false)
+            .await
+            .expect("named stages are tracked");
+
+        assert!(deps.metadata_complete);
+        assert_eq!(
+            deps.stages.keys().map(String::as_str).collect::<Vec<_>>(),
+            [NAMED_STAGE]
+        );
+        assert!(deps.seen_tables.is_empty());
+        assert!(deps.parser_seen_relations.is_empty());
+    }
+
+    #[dbt_runtime::test]
+    async fn custom_materialization_reading_named_stage_tracks_it() {
+        let ctx = test_task_runner_ctx_with_mode_and_sources_extractor(
+            None,
+            RunCacheMode::ReadWrite,
+            false,
+            Arc::new(NamedStageSourcesExtractor { with_table: false }),
+        );
+        let adapter = ctx
+            .adapter_store()
+            .get(AdapterType::Snowflake)
+            .expect("mock adapter");
+        let ctx = ctx_with_adapter_in_env(&ctx, &adapter);
+        let model = make_model(
+            "model.test.custom_reads_stage",
+            "db",
+            "s",
+            "custom_reads_stage",
+            DbtMaterialization::Unknown("custom_table".to_string()),
+        );
+
+        let deps = query_dependencies_for_parse_error(
+            &ctx,
+            model.as_ref(),
+            "select 1",
+            synthetic_extraction_error(),
+        )
+        .await
+        .expect("named stages are tracked");
+
+        assert!(deps.metadata_complete);
+        assert_eq!(
+            deps.stages.keys().map(String::as_str).collect::<Vec<_>>(),
+            [NAMED_STAGE]
+        );
+    }
+
+    #[dbt_runtime::test]
+    async fn stages_are_sent_as_tables_with_their_last_modified_epoch() {
+        let model = make_model(
+            "model.test.reads_stage",
+            "db",
+            "s",
+            "reads_stage",
+            DbtMaterialization::Table,
+        );
+        let ctx = test_task_runner_ctx_with_nodes(
+            None,
+            RunCacheMode::ReadWrite,
+            false,
+            Arc::new(EmptySourcesExtractor),
+            nodes_from(vec![model.clone()], vec![]),
+            ["model.test.reads_stage".to_string()].into_iter().collect(),
+        );
+        let stage = |name: &str| StageDependency {
+            name: name.to_string(),
+            list_sql: format!("LIST {name}"),
+        };
+        let listed = r#"@"DB"."S"."LISTED""#;
+        let unlisted = r#"@"DB"."S"."UNLISTED""#;
+        ctx.inner
+            .run_cache_ctx
+            .run_cache_metadata
+            .insert_last_modified_epoch(listed, Some(1694505600000));
+
+        // Speculative: reads the cache only, so the unlisted stage has no epoch
+        let tables = collect_table_modified_infos(
+            &ctx,
+            model.as_ref(),
+            false,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &BTreeMap::from([
+                (listed.to_string(), stage(listed)),
+                (unlisted.to_string(), stage(unlisted)),
+            ]),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(tables.metadata_complete);
+        assert!(tables.tables.contains(&TableModifiedInfo {
+            name: listed.to_string(),
+            last_modified_epoch: Some(1694505600000),
+            kind: DependencyKind::Unknown as i32,
+        }));
+        assert!(tables.tables.contains(&TableModifiedInfo {
+            name: unlisted.to_string(),
+            last_modified_epoch: None,
+            kind: DependencyKind::Unknown as i32,
+        }));
+    }
+
+    /// Returns the given tables and table-valued functions.
+    struct TableFunctionSourcesExtractor {
+        tables: Vec<FullyQualifiedName>,
+        table_functions: Vec<&'static str>,
+    }
+
+    impl TableFunctionSourcesExtractor {
+        fn upstreams(&self) -> ExtractedUpstreams {
+            ExtractedUpstreams {
+                tables: self.tables.iter().cloned().map(Into::into).collect(),
+                table_functions: self.table_functions.iter().map(|f| f.to_string()).collect(),
+                ..Default::default()
+            }
+        }
+    }
+
+    impl SourcesExtractor for TableFunctionSourcesExtractor {
+        fn extract_upstreams(
+            &self,
+            _adapter_type: AdapterType,
+            _sql: &str,
+            _default_catalog: &str,
+            _default_schema: &str,
+            _quoted_name_ignore_case: bool,
+        ) -> FrontendResult<ExtractedUpstreams> {
+            Ok(self.upstreams())
+        }
+
+        fn extract_standalone_expression_upstreams(
+            &self,
+            _adapter_type: AdapterType,
+            _sql: &str,
+            _default_catalog: &str,
+            _default_schema: &str,
+            _quoted_name_ignore_case: bool,
+        ) -> FrontendResult<ExtractedUpstreams> {
+            Ok(self.upstreams())
+        }
+    }
+
+    #[test]
+    fn parse_sql_relations_for_adapter_reports_table_functions() {
+        let type_ops = DefaultTypeOps::new(AdapterType::Databricks);
+        let parsed = parse_sql_relations_for_adapter(
+            AdapterType::Databricks,
+            "select * from t, table_changes('c.s.t', 1)",
+            "db",
+            "s",
+            false,
+            &TableFunctionSourcesExtractor {
+                tables: vec![FullyQualifiedName::new("db", "s", "t")],
+                table_functions: vec!["table_changes"],
+            },
+            &type_ops,
+        )
+        .expect("table functions should not fail parsing");
+
+        assert_eq!(parsed.relations.len(), 1);
+        assert_eq!(
+            parsed.unsupported_references,
+            BTreeSet::from(["table_changes".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_sql_relations_for_adapter_without_table_functions_has_no_unsupported_references() {
+        let type_ops = DefaultTypeOps::new(AdapterType::Databricks);
+        let parsed = parse_sql_relations_for_adapter(
+            AdapterType::Databricks,
+            "select * from t, range(10)",
+            "db",
+            "s",
+            false,
+            &TableFunctionSourcesExtractor {
+                tables: vec![FullyQualifiedName::new("db", "s", "t")],
+                table_functions: vec![],
+            },
+            &type_ops,
+        )
+        .expect("parse");
+
+        assert_eq!(parsed.relations.len(), 1);
+        assert!(parsed.unsupported_references.is_empty());
+    }
+
+    #[dbt_runtime::test]
+    async fn model_reading_table_function_directly_has_incomplete_metadata() {
+        let ctx = test_task_runner_ctx_with_mode_and_sources_extractor(
+            None,
+            RunCacheMode::ReadWrite,
+            false,
+            Arc::new(TableFunctionSourcesExtractor {
+                tables: vec![],
+                table_functions: vec!["table_changes"],
+            }),
+        );
+        let adapter = ctx
+            .adapter_store()
+            .get(AdapterType::Snowflake)
+            .expect("mock adapter");
+        let ctx = ctx_with_adapter_in_env(&ctx, &adapter);
+        let model = make_model(
+            "model.test.reads_tvf",
+            "db",
+            "s",
+            "reads_tvf",
+            DbtMaterialization::Table,
+        );
+
+        let deps = collect_query_dependencies(&ctx, model.as_ref(), "select 1", false)
+            .await
+            .expect("table functions should fail open");
+
+        assert!(!deps.metadata_complete);
+    }
+
+    #[dbt_runtime::test]
+    async fn model_reading_table_and_table_function_has_incomplete_metadata() {
+        let ctx = test_task_runner_ctx_with_mode_and_sources_extractor(
+            None,
+            RunCacheMode::ReadWrite,
+            false,
+            Arc::new(TableFunctionSourcesExtractor {
+                tables: vec![FullyQualifiedName::new("db", "s", "t")],
+                table_functions: vec!["table_changes"],
+            }),
+        );
+        let adapter = ctx
+            .adapter_store()
+            .get(AdapterType::Snowflake)
+            .expect("mock adapter");
+        let ctx = ctx_with_adapter_in_env(&ctx, &adapter);
+        let model = make_model(
+            "model.test.reads_table_and_tvf",
+            "db",
+            "s",
+            "reads_table_and_tvf",
+            DbtMaterialization::Table,
+        );
+
+        let deps = collect_query_dependencies(&ctx, model.as_ref(), "select 1", false)
+            .await
+            .expect("table functions should fail open");
+
+        assert!(!deps.metadata_complete);
+    }
+
+    #[dbt_runtime::test]
+    async fn custom_materialization_reading_table_function_has_incomplete_metadata() {
+        let ctx = test_task_runner_ctx_with_mode_and_sources_extractor(
+            None,
+            RunCacheMode::ReadWrite,
+            false,
+            Arc::new(TableFunctionSourcesExtractor {
+                tables: vec![],
+                table_functions: vec!["table_changes"],
+            }),
+        );
+        let adapter = ctx
+            .adapter_store()
+            .get(AdapterType::Snowflake)
+            .expect("mock adapter");
+        let ctx = ctx_with_adapter_in_env(&ctx, &adapter);
+        let model = make_model(
+            "model.test.custom_reads_tvf",
+            "db",
+            "s",
+            "custom_reads_tvf",
+            DbtMaterialization::Unknown("custom_table".to_string()),
+        );
+
+        let deps = query_dependencies_for_parse_error(
+            &ctx,
+            model.as_ref(),
+            "select 1",
+            synthetic_extraction_error(),
+        )
+        .await
+        .expect("table functions should fail open");
+
+        assert!(!deps.metadata_complete);
+    }
+
     fn synthetic_frontend_error() -> FrontendError {
         FrontendError::new(
             FrontendErrorCode::Unexpected,
@@ -8956,7 +10043,7 @@ mod tests {
         )
     }
 
-    fn test_task_runner_ctx_with_nodes(
+    pub(crate) fn test_task_runner_ctx_with_nodes(
         run_cache_service_client: Option<dbt_state::service_client::SharedRunCacheServiceClient>,
         run_cache_mode: RunCacheMode,
         full_refresh: bool,
@@ -8997,6 +10084,7 @@ mod tests {
             Execute::Remote,
             test_adapter_globals(&resolver_state.dbt_profile),
             sources_extractor,
+            Arc::new(crate::sql_rewriter::DefaultSqlRewriter),
             RunCacheCtx {
                 run_cache_metadata: Arc::new(RunCacheMetadataCache::new()),
                 run_cache_dev_cloned_nodes: SccHashMap::default(),
@@ -9008,6 +10096,9 @@ mod tests {
                 view_traverser: None,
                 heuristic_clock: std::sync::OnceLock::new(),
                 prefetch: Default::default(),
+                schema_prefetch: Default::default(),
+                dependency_kinds: std::sync::OnceLock::new(),
+                selected_target_fqns: std::sync::OnceLock::new(),
                 shared_event_order: SharedEventOrder::new(),
                 telemetry_session_start: std::sync::OnceLock::new(),
                 telemetry_session_ended: std::sync::atomic::AtomicBool::new(false),
@@ -9640,6 +10731,7 @@ mod tests {
                 execute_hooks_on_any_reuse: None,
                 compare_unrendered_code: None,
                 ignore_external_modifications: Some(ignore),
+                compare_selected_columns: None,
             });
 
             let result = verify_clone_source_freshness(&ctx, &model, &clone).await;
@@ -9966,6 +11058,8 @@ mod tests {
             &BTreeSet::from(["model.pkg.orders".to_string()]),
             &BTreeMap::new(),
             &nodes,
+            None,
+            &BTreeSet::new(),
         )
         .0;
 
@@ -9994,6 +11088,8 @@ mod tests {
             &runnable_set,
             &runtime_deps,
             &nodes,
+            None,
+            &BTreeSet::new(),
         );
 
         assert_eq!(relations.len(), 2);
@@ -10026,6 +11122,8 @@ mod tests {
             &runnable_set,
             &runtime_deps,
             &nodes,
+            None,
+            &BTreeSet::new(),
         );
 
         assert!(
@@ -10072,6 +11170,8 @@ mod tests {
             &runnable_set,
             &BTreeMap::new(),
             &nodes,
+            None,
+            &BTreeSet::new(),
         );
 
         assert_eq!(
@@ -10134,9 +11234,187 @@ mod tests {
             &runnable_set,
             &runtime_deps,
             &nodes,
+            None,
+            &BTreeSet::new(),
         );
 
         assert!(relations.is_empty(), "ephemeral nodes should be excluded");
+    }
+
+    #[test]
+    fn prefetch_skips_data_test_own_relation_but_keeps_its_deps() {
+        let model = make_model(
+            "model.pkg.orders",
+            "db",
+            "analytics",
+            "orders",
+            DbtMaterialization::Table,
+        );
+        let mut test = DbtTest::default();
+        test.__common_attr__.unique_id = "test.pkg.not_null_orders_id".to_string();
+        test.__base_attr__.database = "db".to_string();
+        test.__base_attr__.schema = "analytics_dbt_test__audit".to_string();
+        test.__base_attr__.alias = "not_null_orders_id".to_string();
+        test.__base_attr__.materialized = DbtMaterialization::Test;
+        let mut nodes = nodes_from(vec![model], vec![]);
+        nodes
+            .tests
+            .insert("test.pkg.not_null_orders_id".to_string(), Arc::new(test));
+        let runnable_set = BTreeSet::from(["test.pkg.not_null_orders_id".to_string()]);
+        let runtime_deps = BTreeMap::from([(
+            "test.pkg.not_null_orders_id".to_string(),
+            BTreeSet::from(["model.pkg.orders".to_string()]),
+        )]);
+
+        let (relations, _) = collect_global_prefetch_relations(
+            AdapterType::Snowflake,
+            &runnable_set,
+            &runtime_deps,
+            &nodes,
+            None,
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(
+            relations.keys().collect::<Vec<_>>(),
+            vec![&fqn_of("db", "analytics", "orders")],
+        );
+    }
+
+    #[test]
+    fn prefetch_resolves_deps_through_ephemeral_models() {
+        let mut ephemeral = DbtModel::default();
+        ephemeral.__common_attr__.unique_id = "model.pkg.eph".to_string();
+        ephemeral.__base_attr__.database = "db".to_string();
+        ephemeral.__base_attr__.schema = "analytics".to_string();
+        ephemeral.__base_attr__.alias = "eph".to_string();
+        ephemeral.__base_attr__.materialized = DbtMaterialization::Ephemeral;
+        ephemeral.__base_attr__.depends_on.nodes = vec![
+            "source.pkg.raw.events".to_string(),
+            "model.pkg.upstream".to_string(),
+        ];
+        let upstream = make_model(
+            "model.pkg.upstream",
+            "db",
+            "analytics",
+            "upstream",
+            DbtMaterialization::Table,
+        );
+        let orders = make_model(
+            "model.pkg.orders",
+            "db",
+            "analytics",
+            "orders",
+            DbtMaterialization::Table,
+        );
+        let source = make_source("source.pkg.raw.events", "db", "raw", "events");
+        let nodes = nodes_from(vec![Arc::new(ephemeral), upstream, orders], vec![source]);
+        // The ephemeral is both a dep of a selected model and selected itself.
+        let runnable_set =
+            BTreeSet::from(["model.pkg.orders".to_string(), "model.pkg.eph".to_string()]);
+        let runtime_deps = BTreeMap::from([
+            (
+                "model.pkg.orders".to_string(),
+                BTreeSet::from(["model.pkg.eph".to_string()]),
+            ),
+            (
+                "model.pkg.eph".to_string(),
+                BTreeSet::from(["source.pkg.raw.events".to_string()]),
+            ),
+        ]);
+
+        let (relations, _) = collect_global_prefetch_relations(
+            AdapterType::Snowflake,
+            &runnable_set,
+            &runtime_deps,
+            &nodes,
+            None,
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(
+            relations.into_keys().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                fqn_of("db", "analytics", "orders"),
+                fqn_of("db", "analytics", "upstream"),
+                fqn_of("db", "raw", "events"),
+            ]),
+            "the ephemeral's own relation is skipped, its deps are prefetched"
+        );
+    }
+
+    #[test]
+    fn prefetch_includes_deferred_relation_for_unselected_deps() {
+        let orders = make_model(
+            "model.pkg.orders",
+            "db",
+            "dev",
+            "orders",
+            DbtMaterialization::Table,
+        );
+        let deferred_dep = make_model(
+            "model.pkg.customers",
+            "db",
+            "dev",
+            "customers",
+            DbtMaterialization::Table,
+        );
+        let local_dep = make_model(
+            "model.pkg.items",
+            "db",
+            "dev",
+            "items",
+            DbtMaterialization::Table,
+        );
+        let nodes = nodes_from(vec![orders, deferred_dep, local_dep], vec![]);
+        let defer_nodes = nodes_from(
+            vec![
+                make_model(
+                    "model.pkg.customers",
+                    "db",
+                    "prod",
+                    "customers",
+                    DbtMaterialization::Table,
+                ),
+                make_model(
+                    "model.pkg.items",
+                    "db",
+                    "prod",
+                    "items",
+                    DbtMaterialization::Table,
+                ),
+            ],
+            vec![],
+        );
+        let runnable_set = BTreeSet::from(["model.pkg.orders".to_string()]);
+        let runtime_deps = BTreeMap::from([(
+            "model.pkg.orders".to_string(),
+            BTreeSet::from([
+                "model.pkg.customers".to_string(),
+                "model.pkg.items".to_string(),
+            ]),
+        )]);
+        // Only `customers` was deferred by static analysis.
+        let deferred_fqns = BTreeSet::from([fqn_of("db", "prod", "customers")]);
+
+        let (relations, _) = collect_global_prefetch_relations(
+            AdapterType::Snowflake,
+            &runnable_set,
+            &runtime_deps,
+            &nodes,
+            Some(&defer_nodes),
+            &deferred_fqns,
+        );
+
+        assert_eq!(
+            relations.into_keys().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                fqn_of("db", "dev", "orders"),
+                fqn_of("db", "dev", "customers"),
+                fqn_of("db", "prod", "customers"),
+                fqn_of("db", "dev", "items"),
+            ]),
+        );
     }
 
     #[test]
@@ -10171,6 +11449,8 @@ mod tests {
             &runnable_set,
             &runtime_deps,
             &nodes,
+            None,
+            &BTreeSet::new(),
         );
 
         let source_fqn = fqn_of("db", "raw", "users");
@@ -10223,6 +11503,8 @@ mod tests {
             &runnable_set,
             &runtime_deps,
             &nodes,
+            None,
+            &BTreeSet::new(),
         );
 
         let source_fqn = fqn_of("db", "raw", "users");
@@ -10365,6 +11647,8 @@ mod tests {
             &runnable_set,
             &runtime_deps,
             &nodes,
+            None,
+            &BTreeSet::new(),
         );
 
         // 2 selected models + 1 shared source = 3 unique entries

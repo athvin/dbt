@@ -1,10 +1,36 @@
 //! The [SourcesExtractor] trait: parse a SQL statement and return the upstream
 //! table references it depends on.
 
+use std::collections::BTreeSet;
+
 use dbt_adapter_core::AdapterType;
 use dbt_frontend_common::{
     FullyQualifiedName, error::FrontendResult, named_reference::NamedReference,
+    stage_ref::StageReference,
 };
+
+/// What an extraction found upstream of a statement.
+#[derive(Debug, Clone, Default)]
+pub struct ExtractedUpstreams {
+    /// Upstream table references.
+    pub tables: Vec<NamedReference<FullyQualifiedName>>,
+    /// Names of table-valued functions in FROM, as written, other than pure
+    /// row generators such as `range` (see `dbt_frontend_common::table_functions::is_pure_generator`).
+    pub table_functions: BTreeSet<String>,
+    /// Snowflake stages in FROM, with the location and `PATTERN` that select
+    /// the files read. Each one is also in `tables`, as a table named by its
+    /// location. An extractor that does not report stages leaves this empty.
+    pub stages: BTreeSet<StageReference>,
+}
+
+impl From<Vec<NamedReference<FullyQualifiedName>>> for ExtractedUpstreams {
+    fn from(tables: Vec<NamedReference<FullyQualifiedName>>) -> Self {
+        Self {
+            tables,
+            ..Default::default()
+        }
+    }
+}
 
 pub trait SourcesExtractor: Send + Sync {
     /// Parse `sql` and return the upstream table references, qualified
@@ -17,7 +43,7 @@ pub trait SourcesExtractor: Send + Sync {
         default_catalog: &str,
         default_schema: &str,
         quoted_name_ignore_case: bool,
-    ) -> FrontendResult<Vec<NamedReference<FullyQualifiedName>>>;
+    ) -> FrontendResult<ExtractedUpstreams>;
 
     /// Parse `sql` as a complete standalone SQL expression and return its
     /// upstream table references. Custom materializations may wrap model SQL
@@ -31,5 +57,5 @@ pub trait SourcesExtractor: Send + Sync {
         default_catalog: &str,
         default_schema: &str,
         quoted_name_ignore_case: bool,
-    ) -> FrontendResult<Vec<NamedReference<FullyQualifiedName>>>;
+    ) -> FrontendResult<ExtractedUpstreams>;
 }

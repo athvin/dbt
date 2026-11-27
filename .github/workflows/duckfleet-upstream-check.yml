@@ -1,0 +1,83 @@
+# Weekly: how far behind dbt-labs/dbt main is duckfleet-adapter, and would the merge
+# be clean? Reports in the job summary, and FAILS (so GitHub notifies the owner) when a
+# sync is owed: an upstream v2 release is missing, or the merge would conflict. It
+# pushes nothing. A sync is a reviewed PR (DUCKFLEET.md), and upstream's own
+# workflow changes are not pushable with GITHUB_TOKEN anyway.
+name: duckfleet-upstream-check
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: duckfleet-adapter
+          fetch-depth: 0
+      - name: Compare with upstream
+        id: compare
+        run: |
+          git fetch --quiet https://github.com/dbt-labs/dbt.git main:refs/remotes/upstream/main --tags
+          behind=$(git rev-list --count HEAD..upstream/main)
+          latest=$(git tag --list 'v2.*' --sort=-v:refname | grep -vE -- '-(dev|rc|test)' | head -1)
+          # Upstream cuts v2 releases on their own commits, not on main, so a tag is
+          # never an ancestor. Instead: a release newer than our last sync point with
+          # main (the merge base) is one this branch has not taken.
+          released=$(git log -1 --format=%ct "$latest")
+          synced=$(git log -1 --format=%ct "$(git merge-base HEAD upstream/main)")
+          if [ "$released" -le "$synced" ]; then has_latest=yes; else has_latest=no; fi
+          if out=$(git merge-tree --write-tree --name-only HEAD upstream/main 2>&1); then
+            conflicts=""
+          else
+            conflicts=$(printf '%s\n' "$out" | tail -n +2 | grep -v '^$' | head -50)
+          fi
+          {
+            echo "behind=$behind"
+            echo "latest=$latest"
+            echo "has_latest=$has_latest"
+            echo "conflicts<<EOF"
+            echo "$conflicts"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Report, and fail when a sync is owed
+        env:
+          BEHIND: ${{ steps.compare.outputs.behind }}
+          LATEST: ${{ steps.compare.outputs.latest }}
+          HAS_LATEST: ${{ steps.compare.outputs.has_latest }}
+          CONFLICTS: ${{ steps.compare.outputs.conflicts }}
+        run: |
+          {
+            echo "## duckfleet-adapter vs dbt-labs/dbt main"
+            echo ""
+            echo "- Behind upstream main: **$BEHIND commits**"
+            echo "- Latest upstream v2 release: \`$LATEST\` (included: $HAS_LATEST)"
+            if [ -z "$CONFLICTS" ]; then
+              echo "- Merge: clean (\`git merge upstream/main\` applies with no conflicts)"
+            else
+              echo "- Merge: **conflicts** in:"
+              echo '```'
+              echo "$CONFLICTS"
+              echo '```'
+            fi
+            echo ""
+            echo "Sync with the procedure in DUCKFLEET.md."
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Being behind main is normal between releases. A sync is owed when an
+          # upstream v2 release is missing, or when the merge has started to
+          # conflict (each week it waits, the merge only gets harder).
+          if [ "$HAS_LATEST" != "yes" ]; then
+            echo "::error::duckfleet-adapter does not include upstream $LATEST; sync per DUCKFLEET.md"
+            exit 1
+          fi
+          if [ -n "$CONFLICTS" ]; then
+            echo "::error::merging upstream main would conflict; sync per DUCKFLEET.md"
+            exit 1
+          fi

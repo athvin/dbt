@@ -21,7 +21,9 @@ use dbt_adapter_core::AdapterType;
 use dbt_common::constants::RUNNING;
 use dbt_common::stats::{NodeStatus, Stat};
 use dbt_common::status_reporter::report_completed;
-use dbt_common::tracing::dbt_emit::{emit_error_log_from_fs_error, emit_warn_log_message};
+use dbt_common::tracing::dbt_emit::{
+    emit_error_log_from_fs_error, emit_info_log_message, emit_warn_log_message,
+};
 use dbt_common::tracing::span_info::{find_and_update_span_attrs, update_span_attrs};
 use dbt_common::warn_error_options::WarnErrorOptions;
 use dbt_common::{ErrorCode, FsResult, fs_err};
@@ -57,11 +59,11 @@ use dbt_tasks_core::run_cache::run_cache_service::{
     CachedTestExecutionResult, RunCacheAfterSuccess, RunCacheCloneDecision, RunCacheCloneError,
     RunCacheCloneGrantsOrder, RunCacheReuseHookExecutor, RunCacheReuseHookPhase,
     RunCacheServiceDecision, clear_stale_missing_last_modified_epoch_for_node,
-    confirm_run_cache_service_execution, evict_node_metadata_for_untracked_rebuild,
-    execute_run_cache_service_clone, insert_compiled_view_definition,
-    record_run_cache_clone_decision, record_run_cache_service_execution,
-    refresh_final_last_modified_epoch_for_node, replay_dev_clone_decision,
-    replay_run_cache_clone_decision, run_cache_service_before_execution,
+    clone_source_is_missing, confirm_run_cache_service_execution,
+    evict_node_metadata_for_untracked_rebuild, execute_run_cache_service_clone,
+    insert_compiled_view_definition, record_run_cache_clone_decision,
+    record_run_cache_service_execution, refresh_final_last_modified_epoch_for_node,
+    replay_dev_clone_decision, replay_run_cache_clone_decision, run_cache_service_before_execution,
     should_execute_hooks_for_skip_reuse,
 };
 use dbt_tasks_core::run_cache::state_lock::release_state_lock;
@@ -412,13 +414,25 @@ impl Task for RunTask {
                                         RunCacheAfterSuccess::None
                                     }
                                     Err(RunCacheCloneError::Recoverable(err)) => {
-                                        emit_warn_log_message(
-                                            ErrorCode::StateServiceWarn,
-                                            format!(
-                                                "dbt State service clone failed for node {}: {err}; executing normally",
-                                                self.node.unique_id()
-                                            ),
-                                        );
+                                        if clone_source_is_missing(ctx, self.node.as_ref(), clone)
+                                            .await
+                                        {
+                                            // The model runs and the data is correct, so
+                                            // there is nothing for the user to fix.
+                                            emit_info_log_message(format!(
+                                                "Unable to clone node '{}': clone source '{}' not found, running the model instead: {err}",
+                                                self.node.unique_id(),
+                                                clone.clone_source()
+                                            ));
+                                        } else {
+                                            emit_warn_log_message(
+                                                ErrorCode::StateServiceWarn,
+                                                format!(
+                                                    "dbt State service clone failed for node {}: {err}; executing normally",
+                                                    self.node.unique_id()
+                                                ),
+                                            );
+                                        }
                                         clone
                                             .fallback_confirmation()
                                             .map(RunCacheAfterSuccess::Confirm)
@@ -579,9 +593,13 @@ impl Task for RunTask {
                         .await
                 }
                 (None, Ok(RunExecutionPath::LakeCompute)) => {
-                    self.task_hooks
-                        .run_on_lake_compute(ctx, Arc::clone(&self.node), task_result.clone())
-                        .await
+                    run_on_lake_compute_with_hooks(
+                        ctx,
+                        &self.node,
+                        task_result.clone(),
+                        &self.task_hooks,
+                    )
+                    .await
                 }
             };
 
@@ -667,6 +685,11 @@ impl Task for RunTask {
                     }
 
                     node_status
+                }
+                // Cancelled with the run: return the error without recording a stat or logging it.
+                // The visitor then skips the node (`--fail-fast`) or leaves it out (Ctrl+C).
+                Err(e) if e.code.is_cancellation() && ctx.is_cancelled(self.node.as_ref()) => {
+                    return Err(e);
                 }
                 Err(e) => {
                     // TODO: At some point, these should log as part of the same event
@@ -796,7 +819,10 @@ async fn execute_run_cache_service_clone_with_hooks(
             hook_node.grants_order()
         });
     let hook_executor = hook_node
-        .map(|hook_node| build_reuse_hook_executor(ctx, node, task_result, hook_node))
+        .map(|hook_node| {
+            ctx.run_base_context(node)
+                .map(|base_context| build_reuse_hook_executor(base_context, task_result, hook_node))
+        })
         .transpose()
         .map_err(RunCacheCloneError::Fatal)?;
     execute_run_cache_service_clone(
@@ -825,7 +851,8 @@ async fn execute_hooks_for_run_cache_skip_reuse(
     let Some(hook_node) = run_cache_reuse_hook_node(node, service_default) else {
         return Ok(());
     };
-    let hook_executor = build_reuse_hook_executor(ctx, node, task_result, hook_node)?;
+    let hook_executor =
+        build_reuse_hook_executor(ctx.run_base_context(node)?, task_result, hook_node);
     let ctx_inner = ctx.clone();
     run_blocking_task_operation(move || {
         hook_executor(&ctx_inner, RunCacheReuseHookPhase::Pre)?;
@@ -913,17 +940,15 @@ fn model_grants_order(
 }
 
 fn build_reuse_hook_executor(
-    ctx: &TaskRunnerCtx,
-    node: &dyn InternalDbtNodeAttributes,
+    base_context: minijinja::Value,
     task_result: Option<&TaskResult>,
     hook_node: RunCacheReuseHookNode,
-) -> FsResult<RunCacheReuseHookExecutor> {
-    let base_context = ctx.run_base_context(node)?;
+) -> RunCacheReuseHookExecutor {
     let sql = task_result.map(|task_result| task_result.sql_instruction.sql.clone());
-    Ok(Arc::new(move |ctx, phase| {
+    Arc::new(move |ctx, phase| {
         let sql = sql.as_deref();
         execute_hook_node_blocking(&hook_node, ctx, &base_context, sql, phase)
-    }))
+    })
 }
 
 fn hooks_are_configured(hooks: &Option<dbt_schemas::schemas::common::Hooks>) -> bool {
@@ -986,6 +1011,47 @@ fn execute_hook_node_blocking(
             phase,
         ),
     }
+}
+
+/// Runs a compute_platform write between the node's pre-hooks and post-hooks, on its own adapter.
+async fn run_on_lake_compute_with_hooks(
+    ctx: &mut TaskRunnerCtx,
+    node: &Arc<dyn InternalDbtNodeAttributes>,
+    task_result: Option<TaskResult>,
+    task_hooks: &Arc<dyn RunTaskHooks>,
+) -> FsResult<NodeStatus> {
+    // The bypass skips the materialization macro, which runs node hooks; of the models,
+    // only a table or an incremental is written.
+    let hook_node =
+        RunCacheReuseHookNode::from_node(node.as_ref()).filter(|hook_node| match hook_node {
+            RunCacheReuseHookNode::Model(model) => matches!(
+                model.materialized(),
+                DbtMaterialization::Table | DbtMaterialization::Incremental
+            ),
+            _ => true,
+        });
+    let Some(hook_node) = hook_node else {
+        return task_hooks
+            .run_on_lake_compute(ctx, Arc::clone(node), task_result)
+            .await;
+    };
+    let hook_executor = build_reuse_hook_executor(
+        ctx.compute_platform_base_context(node.as_ref())?,
+        task_result.as_ref(),
+        hook_node,
+    );
+
+    let pre_hooks = Arc::clone(&hook_executor);
+    let ctx_inner = ctx.clone();
+    run_blocking_task_operation(move || pre_hooks(&ctx_inner, RunCacheReuseHookPhase::Pre))
+        .await??;
+    let status = task_hooks
+        .run_on_lake_compute(ctx, Arc::clone(node), task_result)
+        .await?;
+    let ctx_inner = ctx.clone();
+    run_blocking_task_operation(move || hook_executor(&ctx_inner, RunCacheReuseHookPhase::Post))
+        .await??;
+    Ok(status)
 }
 
 async fn run_cache_after_success_action(
@@ -1572,6 +1638,7 @@ mod tests {
             execute_hooks_on_any_reuse,
             compare_unrendered_code: None,
             ignore_external_modifications: None,
+            compare_selected_columns: None,
         });
         model.deprecated_config.pre_hook =
             Verbatim::from(Some(Hooks::String("select 1".to_string())));

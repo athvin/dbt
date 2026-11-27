@@ -5,11 +5,13 @@ use dbt_adapter_core::AdapterType;
 use dbt_common::FsError;
 use dbt_common::cancellation::CancellationToken;
 use dbt_common::constants::DBT_GENERIC_TESTS_DIR_NAME;
-use dbt_common::io_args::{FsCommand, multi_adapter_enabled};
+use dbt_common::io_args::{FsCommand, multi_adapter_enabled, project_flag_lookup};
 use dbt_common::once_cell_vars::DISPATCH_CONFIG;
 use dbt_common::path::DbtPath;
 use dbt_common::stdfs;
-use dbt_common::tracing::dbt_emit::{emit_error_log_from_fs_error, emit_warn_log_from_fs_error};
+use dbt_common::tracing::dbt_emit::{
+    emit_error_log_from_fs_error, emit_strict_parse_error, emit_warn_log_from_fs_error,
+};
 use dbt_common::tracing::event_info::store_event_attributes;
 use dbt_common::{ErrorCode, FsResult, err, fs_err};
 use dbt_jinja_utils::JinjaFactory;
@@ -60,7 +62,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::resolve::properties_index::{PropertiesEntry, index_properties};
-use crate::resolve::resolvable_node::{EnabledNodes, ResolvableNodes, ResolveCtx};
+use crate::resolve::resolvable_node::{
+    EnabledNodes, LinkCtx, LinkedDependency, ResolvableNodes, ResolveCtx,
+};
 use crate::resolve::resolve_macros::apply_macro_patches;
 use crate::resolve::resolve_macros::probe_internal_macro_overrides;
 use crate::resolve::resolve_macros::resolve_docs_macros;
@@ -283,6 +287,7 @@ pub async fn resolve(
     let mut semantic_layer_spec_is_legacy = false;
     let mut test_name_truncations: HashMap<String, String> = HashMap::new();
     let all_macro_properties: BTreeMap<String, BTreeMap<String, PropertiesEntry>>;
+    let kinds = Arc::new(resolvable_nodes.enabled(dbt_state.root_project().flags.as_ref()));
 
     let (
         resolved_nodes,
@@ -306,7 +311,7 @@ pub async fn resolve(
         root_runtime_config.clone(),
         token,
         jinja_type_checking_event_listener_factory.clone(),
-        Arc::new(resolvable_nodes.enabled(dbt_state.root_project().flags.as_ref())),
+        Arc::clone(&kinds),
     )
     .await?;
     nodes.extend(resolved_nodes);
@@ -428,6 +433,23 @@ pub async fn resolve(
         &mut operations,
         &node_resolver,
     );
+    // Each kind adds the dependencies between nodes that only it knows of. They are read by
+    // the checks below as the ones above are.
+    for kind in kinds.on() {
+        let mut ctx = LinkCtx {
+            arg: &arg,
+            dbt_state: &dbt_state,
+            jinja_env: &jinja_env,
+            macros: &macros,
+            root_runtime_config: &root_runtime_config,
+            nodes: &nodes,
+            dependencies: Vec::new(),
+        };
+        kind.link(&mut ctx).await?;
+        let dependencies = ctx.dependencies;
+        add_linked_dependencies(&mut nodes, dependencies);
+    }
+
     for warning in microbatch_model_no_event_time_inputs_warnings(&nodes) {
         emit_warn_log_from_fs_error(warning);
     }
@@ -457,6 +479,35 @@ pub async fn resolve(
     // Validate function configuration against per-adapter capabilities:
     // JS UDF language support, JS-aggregate restrictions, default arguments.
     validate_function_config(&nodes, adapter_type);
+
+    // `metricflow` is a config of models only while `metricflow_v2` is on. While it is off, it
+    // is a config that nothing reads, on whichever of a model's config sources it is set.
+    if !dbt_flags::METRICFLOW_V2
+        .resolve_with_project(&project_flag_lookup(
+            dbt_state.root_project().flags.as_ref(),
+        ))
+        .value
+    {
+        for model in nodes.models.values_mut() {
+            if model.deprecated_config.metricflow.is_none() {
+                continue;
+            }
+            let model = Arc::make_mut(model);
+            model.deprecated_config.metricflow = None;
+            let package_name = &model.__common_attr__.package_name;
+            emit_strict_parse_error(
+                *fs_err!(
+                    code => ErrorCode::UnusedConfigKey,
+                    loc => model.__common_attr__.original_file_path.to_path_buf(),
+                    "Ignored unexpected config `metricflow` of model '{}': the `{}` feature \
+                     flag is off",
+                    model.__common_attr__.name,
+                    dbt_flags::METRICFLOW_V2.name
+                ),
+                (package_name != root_project_name).then_some(package_name.as_str()),
+            );
+        }
+    }
 
     resolver_hooks.post_resolve(
         &arg.io,
@@ -517,6 +568,40 @@ pub async fn resolve(
         },
         jinja_env,
     ))
+}
+
+/// Adds the dependencies that a kind's [`ResolvableNode::link`] gave to `nodes`, as the ones
+/// `ref()` and `source()` give.
+///
+/// A dependency is added if both nodes are enabled nodes of dbt's own kinds and are not the
+/// same node. A node that a feature adds is not in the graph that selection and `state:` read.
+fn add_linked_dependencies(nodes: &mut Nodes, dependencies: Vec<LinkedDependency>) {
+    for LinkedDependency {
+        node,
+        depends_on,
+        location,
+    } in dependencies
+    {
+        if node == depends_on
+            || !nodes.contains(&depends_on)
+            || nodes.injected.contains_key(&depends_on)
+            || nodes.injected.contains_key(&node)
+        {
+            continue;
+        }
+        let Some(node) = nodes.get_value_mut(&node) else {
+            continue;
+        };
+        let node_depends_on = &mut node.base_mut().depends_on;
+        if !node_depends_on.nodes.contains(&depends_on) {
+            node_depends_on.nodes.push(depends_on.clone());
+        }
+        // A node that is not resolved again keeps what an earlier resolve added.
+        let located = (depends_on, location);
+        if !node_depends_on.nodes_with_ref_location.contains(&located) {
+            node_depends_on.nodes_with_ref_location.push(located);
+        }
+    }
 }
 
 // Check that models accessing other models (dependecies) can do so.
@@ -3121,5 +3206,80 @@ catalogs:
             Arc::new(make_seed(AdapterType::Snowflake, None)),
         );
         assert!(check_compute_platform_upstreams(&nodes, None, AdapterType::Snowflake).is_err());
+    }
+
+    mod linked_dependencies {
+        use std::sync::Arc;
+
+        use dbt_common::CodeLocationWithFile;
+        use dbt_schemas::schemas::{CommonAttributes, DbtModel, Nodes};
+
+        use crate::resolve::resolvable_node::LinkedDependency;
+        use crate::resolver::add_linked_dependencies;
+
+        /// Models `model.p.a` and `model.p.b`, which depend on nothing.
+        fn nodes() -> Nodes {
+            let mut nodes = Nodes::default();
+            for unique_id in ["model.p.a", "model.p.b"] {
+                let model = DbtModel {
+                    __common_attr__: CommonAttributes {
+                        unique_id: unique_id.to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                nodes.models.insert(unique_id.to_string(), Arc::new(model));
+            }
+            nodes
+        }
+
+        fn dependency(node: &str, depends_on: &str) -> LinkedDependency {
+            LinkedDependency {
+                node: node.to_string(),
+                depends_on: depends_on.to_string(),
+                location: CodeLocationWithFile::default(),
+            }
+        }
+
+        #[test]
+        fn a_linked_dependency_is_added_once() {
+            let mut nodes = nodes();
+            add_linked_dependencies(
+                &mut nodes,
+                vec![
+                    dependency("model.p.a", "model.p.b"),
+                    dependency("model.p.a", "model.p.b"),
+                ],
+            );
+            // A node that is not resolved again is linked again by the next resolve.
+            add_linked_dependencies(&mut nodes, vec![dependency("model.p.a", "model.p.b")]);
+
+            let depends_on = &nodes.models["model.p.a"].__base_attr__.depends_on;
+            assert_eq!(depends_on.nodes, ["model.p.b"]);
+            assert_eq!(depends_on.nodes_with_ref_location.len(), 1);
+            assert!(
+                nodes.models["model.p.b"]
+                    .__base_attr__
+                    .depends_on
+                    .nodes
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn a_dependency_on_itself_or_on_no_node_is_not_added() {
+            let mut nodes = nodes();
+            add_linked_dependencies(
+                &mut nodes,
+                vec![
+                    dependency("model.p.a", "model.p.a"),
+                    dependency("model.p.a", "model.p.gone"),
+                    dependency("model.p.gone", "model.p.b"),
+                ],
+            );
+            for model in nodes.models.values() {
+                assert!(model.__base_attr__.depends_on.nodes.is_empty());
+            }
+        }
     }
 }

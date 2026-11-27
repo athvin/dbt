@@ -177,6 +177,7 @@ fn pre_render_tables_field(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resolve::injected_properties::NoInjectedPropertiesByKind;
     use crate::resolve::properties_index::PropertiesFile;
     use crate::resolve::resolve_sources::Sources;
     use std::path::Path;
@@ -199,7 +200,11 @@ mod tests {
                 &[],
             )?;
             properties
-                .index_file(&[&Sources], file, &IndexCtx::new(&jinja_env, &base_ctx))
+                .index_file(
+                    &[&Sources::<NoInjectedPropertiesByKind>::default()],
+                    file,
+                    &IndexCtx::new(&jinja_env, &base_ctx),
+                )
                 .await?;
         }
         Ok(take_source_table_entries(

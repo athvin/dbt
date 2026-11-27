@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod column_aware;
 pub mod explain;
 pub mod hash;
 pub mod materialization;
@@ -12,6 +13,7 @@ pub mod run_cache_defer;
 pub mod selector;
 pub mod service_client;
 pub mod service_config;
+pub mod stage;
 pub mod task_cache;
 pub mod task_cache_noop;
 pub mod task_cache_redis;

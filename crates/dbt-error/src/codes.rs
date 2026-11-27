@@ -244,6 +244,7 @@ pub enum ErrorCode {
     BridgeConfig = 1318,
     /// The Bridge service failed internally (SQLSTATE `XXR*`).
     BridgeInternal = 1319,
+    BigqueryTimeoutSecondsNotEnforced = 1320,
 
     // Execution/runtime [1400–1449]
     PlannerFailed = 1400,
@@ -274,6 +275,9 @@ pub enum ErrorCode {
     /// no longer matched the owner that ran it; a reclaim already overwrote
     /// it, so the write would have clobbered the new owner's own result.
     StateStopRejected = 1414,
+    /// dbt State could not list the files of a Snowflake stage that a model
+    /// reads, so the stage is treated as modified.
+    StateStageListFailed = 1421,
     /// A unit test running under local compute calls a project function that
     /// local compute cannot execute (a non-SQL language, a non-scalar kind,
     /// overloads, or dependencies on other functions or relations).
@@ -311,6 +315,8 @@ pub enum ErrorCode {
     SelectionOverrideSkipped = 1604,
     /// The nodes actually reported by the run differ from the externally supplied node set.
     SelectionOverrideDivergence = 1605,
+    /// `--empty` could not make a model's SQL read zero rows, so the model was not run.
+    EmptyRewriteFailed = 1606,
 
     // --------------------------------------------------------------------------------------------
     // Checks
@@ -558,6 +564,14 @@ impl ErrorCode {
         (*self as u16) >= (Self::NotSupported as u16)
     }
 
+    /// Whether this code is a cancelled operation or task rather than a failure.
+    pub fn is_cancellation(&self) -> bool {
+        matches!(
+            self,
+            ErrorCode::OperationCanceled | ErrorCode::TaskCancelled
+        )
+    }
+
     pub fn is_frontend(&self) -> bool {
         (*self as u16) < (Self::Generic as u16)
     }
@@ -798,6 +812,14 @@ mod tests {
         assert_eq!(
             ErrorCode::StateStopRejected.name_and_code(),
             "StateStopRejected (dbt1414)"
+        );
+    }
+
+    #[test]
+    fn state_stage_list_failed_renders_name_and_code() {
+        assert_eq!(
+            ErrorCode::StateStageListFailed.name_and_code(),
+            "StateStageListFailed (dbt1421)"
         );
     }
 
