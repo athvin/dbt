@@ -861,8 +861,13 @@ struct GatewayFailure {
 impl GatewayFailure {
     /// Whether an open should keep waiting rather than fail: the gateway is
     /// draining/starting or a proxy returned 502/503/504.
+    /// Refusals of a session open that executed nothing and clear on their own:
+    /// a draining or starting gateway, a gateway at capacity, or a proxy error.
     fn waitable_on_open(&self) -> bool {
-        matches!(self.kind.as_deref(), Some("draining") | Some("starting"))
+        matches!(
+            self.kind.as_deref(),
+            Some("draining") | Some("starting") | Some("capacity")
+        )
             || matches!(self.status, 502..=504)
     }
 
