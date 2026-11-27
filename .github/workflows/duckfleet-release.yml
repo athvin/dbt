@@ -7,6 +7,13 @@ name: duckfleet-release
 #
 # Trigger manually (workflow_dispatch) for a throwaway artifact, or push a
 # `duckfleet-v*` tag to cut a GitHub Release with the binary attached.
+#
+# A tag also publishes every install path, with no manual step (athvin/duck-fleet#215):
+# the four tarballs with build-provenance attestations, a combined SHA256SUMS,
+# `dbt-installer.sh` (curl | sh), and Formula/dbt-duckfleet.rb pushed to
+# athvin/homebrew-duckfleet. `cargo binstall` reads the tarballs through the
+# metadata in crates/dbt-sa-cli/Cargo.toml. The asset names are unchanged, because
+# athvin/duck-fleet's docker/dbt.Dockerfile downloads them by name.
 
 on:
   workflow_dispatch:
@@ -16,6 +23,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 concurrency:
   group: duckfleet-release-${{ github.ref }}
@@ -89,6 +98,12 @@ jobs:
           ( cd dist && if command -v sha256sum > /dev/null; then sha256sum "$name"; else shasum -a 256 "$name"; fi > "$name.sha256" )
           ls -l dist
 
+      - name: Attest build provenance
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/dbt-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -103,3 +118,54 @@ jobs:
           files: |
             dist/dbt-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
             dist/dbt-${{ matrix.os }}-${{ matrix.arch }}.tar.gz.sha256
+
+  # Everything that needs all four builds: the combined checksums, the installer,
+  # and the Homebrew formula. Tags only.
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums and installer
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum dbt-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 4
+          sed "s/@DBT_RELEASE_TAG@/${GITHUB_REF_NAME}/" ../scripts/duckfleet/install.sh > dbt-installer.sh
+          sh -n dbt-installer.sh
+
+      - name: Attach to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/SHA256SUMS
+            dist/dbt-installer.sh
+
+      # A deploy key that can write only to the tap. The tap is a separate
+      # repository, which GITHUB_TOKEN cannot push to.
+      - name: Push the Homebrew formula
+        env:
+          TAP_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$TAP_KEY" || { echo "::error::HOMEBREW_TAP_DEPLOY_KEY is not set"; exit 1; }
+          mkdir -p ~/.ssh && printf '%s\n' "$TAP_KEY" > ~/.ssh/tap && chmod 600 ~/.ssh/tap
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap -o IdentitiesOnly=yes"
+          git clone --depth 1 git@github.com:athvin/homebrew-duckfleet.git tap
+          sh scripts/duckfleet/formula.sh "$GITHUB_REF_NAME" dist/SHA256SUMS > tap/Formula/dbt-duckfleet.rb
+          cd tap
+          if git diff --quiet; then echo "formula already current"; exit 0; fi
+          git -c user.name="duckfleet-release" -c user.email="duckfleet-release@users.noreply.github.com" \
+            commit -am "dbt-duckfleet ${GITHUB_REF_NAME#duckfleet-v}"
+          git push origin HEAD
+

@@ -12,6 +12,26 @@ version.workspace = true
 [lints]
 workspace = true
 
+# `cargo binstall --git https://github.com/athvin/dbt dbt-sa-cli` installs the
+# prebuilt DuckFleet `dbt` from the latest duckfleet-v* release rather than
+# compiling (athvin/duck-fleet#215). The release tags are not the crate version,
+# so each target points at the latest release's tarball by name.
+[package.metadata.binstall]
+pkg-fmt = "tgz"
+bin-dir = "dbt{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "https://github.com/athvin/dbt/releases/latest/download/dbt-linux-x86_64.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "https://github.com/athvin/dbt/releases/latest/download/dbt-linux-aarch64.tar.gz"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "https://github.com/athvin/dbt/releases/latest/download/dbt-darwin-x86_64.tar.gz"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "https://github.com/athvin/dbt/releases/latest/download/dbt-darwin-aarch64.tar.gz"
+
 [dependencies]
 dbt-clap-core = { workspace = true }
 dbt-common = { workspace = true }
