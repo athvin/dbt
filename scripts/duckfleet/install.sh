@@ -50,6 +50,14 @@ sha256() {
   else shasum -a 256 "$1" | cut -d' ' -f1; fi
 }
 
+# The Linux build targets glibc 2.35 (Ubuntu 22.04, Debian 12) and newer.
+if [ "$os" = linux ] && command -v ldd >/dev/null 2>&1; then
+  glibc=$(ldd --version 2>/dev/null | head -1 | sed -n 's/.* \([0-9][0-9]*\.[0-9][0-9]*\)$/\1/p')
+  case "$glibc" in
+    2.[0-9] | 2.[0-2][0-9] | 2.3[0-4]) die "dbt needs glibc 2.35 or newer; this system has $glibc" ;;
+  esac
+fi
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 say "downloading $asset${tag:+ ($tag)}"
